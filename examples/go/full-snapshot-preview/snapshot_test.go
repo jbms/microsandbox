@@ -89,12 +89,12 @@ func own(t *testing.T, s *msb.Sandbox, name string) {
 }
 func restore(t *testing.T, ctx context.Context, name, ref string, forked bool) *msb.Sandbox {
 	t.Helper()
-	opts := []msb.SandboxOption{msb.WithFromSnapshot(ref)}
+	var opts []msb.RestoreOption
 	if forked {
 		opts = append(opts, msb.WithForked())
 	}
 	start := time.Now()
-	s, err := msb.CreateSandbox(ctx, name, opts...)
+	s, err := msb.RestoreSandbox(ctx, ref, name, opts...)
 	check(t, err)
 	own(t, s, name)
 	t.Logf("restore %s forked=%v: %s", name, forked, time.Since(start))
