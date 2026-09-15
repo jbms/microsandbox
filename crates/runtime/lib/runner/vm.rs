@@ -1439,7 +1439,7 @@ fn run(
                 startup_exit_handle.trigger();
                 return;
             }
-            match request_guest_shutdown(&startup_shared) {
+            match request_guest_shutdown_async(&startup_shared).await {
                 Ok(()) => {
                     tokio::time::sleep(startup_shutdown_flush_timeout).await;
                     tracing::info!("startup command shutdown flush window elapsed");
@@ -1495,7 +1495,7 @@ fn run(
                             EXIT_REASON_IDLE_TIMEOUT,
                             std::sync::atomic::Ordering::SeqCst,
                         );
-                        match request_guest_shutdown(&heartbeat_shared) {
+                        match request_guest_shutdown_async(&heartbeat_shared).await {
                             Ok(()) => {
                                 tokio::time::sleep(heartbeat_shutdown_flush_timeout).await;
                                 tracing::info!(
@@ -3190,20 +3190,32 @@ async fn mark_run_failed(db: &DbWriteConnection, run_id: i32) -> RuntimeResult<(
 }
 
 /// Request guest poweroff through agentd without requiring a client connection.
+#[cfg(any(unix, test))]
 fn request_guest_shutdown(shared: &ConsoleSharedState) -> RuntimeResult<()> {
     request_guest_shutdown_with_timeout(shared, Duration::from_secs(60))
 }
 
+/// Startup/idle tasks must yield while the relay writer delivers their shutdown request.
+async fn request_guest_shutdown_async(shared: &Arc<ConsoleSharedState>) -> RuntimeResult<()> {
+    relay::push_guest_frame_until_async(shared, guest_shutdown_frame()?, Duration::from_secs(60))
+        .await
+}
+
+#[cfg(any(unix, test))]
 fn request_guest_shutdown_with_timeout(
     shared: &ConsoleSharedState,
     timeout: Duration,
 ) -> RuntimeResult<()> {
+    relay::push_guest_frame_until(shared, guest_shutdown_frame()?, timeout)
+}
+
+fn guest_shutdown_frame() -> RuntimeResult<Vec<u8>> {
     let msg = Message::with_payload(MessageType::Shutdown, 0, &())
         .map_err(|e| RuntimeError::Custom(format!("encode idle shutdown: {e}")))?;
     let mut frame = Vec::new();
     codec::encode_to_buf(&msg, &mut frame)
         .map_err(|e| RuntimeError::Custom(format!("encode idle shutdown frame: {e}")))?;
-    relay::push_guest_frame_until(shared, frame, timeout)
+    Ok(frame)
 }
 
 fn guest_shutdown_flush_timeout(has_handoff_init: bool) -> Duration {

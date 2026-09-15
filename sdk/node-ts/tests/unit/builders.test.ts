@@ -403,7 +403,7 @@ describe("SandboxBuilder.build", () => {
     for (const method of ["fromSnapshot", "forked", "diskOnly", "snapshotBase", "externalMountPolicy"]) {
       expect(create).not.toHaveProperty(method);
     }
-    for (const method of ["image", "memory", "cpus", "cmd", "replace", "create"]) {
+    for (const method of ["image", "network", "cmd", "entrypoint", "replace", "create"]) {
       expect(restore).not.toHaveProperty(method);
     }
   });

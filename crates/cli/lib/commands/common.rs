@@ -885,7 +885,7 @@ impl SandboxOpts {
 
     /// Builds the network policy selected by the related CLI flags.
     #[cfg(feature = "net")]
-    fn build_network_policy(
+    pub(super) fn build_network_policy(
         &self,
     ) -> anyhow::Result<Option<microsandbox_network::policy::NetworkPolicy>> {
         use microsandbox_network::policy::{Action, NetworkPolicy, NetworkProfile};

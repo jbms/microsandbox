@@ -45,12 +45,24 @@ from microsandbox import (
     SecretChangeKind,
     SecretEntry,
     SecurityProfile,
+    Snapshot,
+    SnapshotCopyBuilder,
+    SnapshotHandle,
     Stdin,
     StdinMode,
     Volume,
     default_backend_kind,
     set_default_backend,
 )
+
+
+def test_snapshot_types_expose_archive_operations() -> None:
+    assert callable(Snapshot.save_to)
+    assert callable(Snapshot.copy_to)
+    assert callable(SnapshotCopyBuilder.labels)
+    assert callable(SnapshotCopyBuilder.record_integrity)
+    assert callable(SnapshotCopyBuilder.save)
+    assert callable(SnapshotHandle.save_to)
 
 
 def test_enum_members_compare_equal_to_values() -> None:
@@ -299,6 +311,12 @@ def test_sandbox_create_treats_explicit_none_as_omitted() -> None:
             image=None,
             from_snapshot="definitely-missing-snapshot",
         )
+
+
+@pytest.mark.asyncio
+async def test_missing_local_snapshot_is_reported_when_restore_is_awaited() -> None:
+    with pytest.raises(FileNotFoundError, match="snapshot not found"):
+        await Sandbox.restore("definitely-missing-snapshot", name="missing-local-snapshot")
 
 
 @pytest.mark.asyncio

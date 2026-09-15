@@ -145,8 +145,8 @@ const (
 	// ErrMetricsUnavailable indicates metrics have no current sample for this sandbox.
 	ErrMetricsUnavailable
 
-	// ErrUnsupportedOperation indicates the sandbox runtime is too old for the
-	// requested feature; restart the sandbox to update it.
+	// ErrUnsupportedOperation indicates that the selected backend or sandbox
+	// runtime does not provide the requested operation.
 	ErrUnsupportedOperation
 
 	// ErrInternal is every other error from the runtime.
@@ -168,6 +168,9 @@ const (
 	ErrRuntimeNotInstalled
 	// ErrRuntimeIncomplete indicates a partial or invalid explicitly selected runtime.
 	ErrRuntimeIncomplete
+	// ErrSandboxStopTimedOut indicates graceful shutdown was not observed
+	// before the SDK's deadline and may still complete asynchronously.
+	ErrSandboxStopTimedOut
 )
 
 func (k ErrorKind) String() string {
@@ -180,6 +183,8 @@ func (k ErrorKind) String() string {
 		return "SandboxAlreadyExists"
 	case ErrSandboxReplaced:
 		return "SandboxReplaced"
+	case ErrSandboxStopTimedOut:
+		return "SandboxStopTimedOut"
 	case ErrSandboxStillRunning:
 		return "SandboxStillRunning"
 	case ErrVolumeNotFound:
@@ -373,6 +378,8 @@ func kindFromFFI(kind string) ErrorKind {
 		return ErrSandboxAlreadyExists
 	case ffi.KindSandboxReplaced:
 		return ErrSandboxReplaced
+	case ffi.KindSandboxStopTimedOut:
+		return ErrSandboxStopTimedOut
 	case ffi.KindSandboxStillRunning:
 		return ErrSandboxStillRunning
 	case ffi.KindVolumeNotFound:

@@ -700,7 +700,7 @@ Request graceful shutdown and return once the request is sent, without waiting f
 
 #### <span className="msb-recv">sb.</span><span className="msb-hn">stop()</span>
 
-<Tooltip tip="Graceful stop works on microsandbox cloud; timeout expiry cannot escalate to force kill."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
+<Tooltip tip="On Cloud, the timeout only limits how long the SDK waits; the accepted stop may continue server-side."><span className="msb-badge-limited">Different on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
 
 ```rust
 async fn stop(&self) -> MicrosandboxResult<()>
@@ -718,7 +718,7 @@ Request graceful shutdown and wait indefinitely for the targeted run to become t
 
 #### <span className="msb-recv">sb.</span><span className="msb-hn">stop_with_timeout()</span>
 
-<Tooltip tip="Graceful stop works on microsandbox cloud; timeout expiry cannot escalate to force kill."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
+<Tooltip tip="On Cloud, the timeout only limits how long the SDK waits; the accepted stop may continue server-side."><span className="msb-badge-limited">Different on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
 
 ```rust
 async fn stop_with_timeout(&self, timeout: Duration) -> MicrosandboxResult<()>
@@ -2642,7 +2642,7 @@ Current status
 
 #### <span className="msb-recv">h.</span><span className="msb-hn">stop()</span>
 
-<Tooltip tip="Graceful stop works on microsandbox cloud; timeout expiry cannot escalate to force kill."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
+<Tooltip tip="On Cloud, the timeout only limits how long the SDK waits; the accepted stop may continue server-side."><span className="msb-badge-limited">Different on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
 
 ```rust
 stop()
@@ -2656,7 +2656,7 @@ Wait indefinitely for graceful completion and release of the same runtime's owne
 
 #### <span className="msb-recv">h.</span><span className="msb-hn">stop_with_timeout()</span>
 
-<Tooltip tip="Graceful stop works on microsandbox cloud; timeout expiry cannot escalate to force kill."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
+<Tooltip tip="On Cloud, the timeout only limits how long the SDK waits; the accepted stop may continue server-side."><span className="msb-badge-limited">Different on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
 
 ```rust
 stop_with_timeout(timeout)

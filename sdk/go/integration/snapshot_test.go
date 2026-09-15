@@ -115,7 +115,7 @@ func TestSandboxHandleSnapshotAndRestore(t *testing.T) {
 	}
 
 	phaseStart = time.Now()
-	fork, err := microsandbox.RestoreSandbox(ctx, snapshotSelector, forkName)
+	fork, err := microsandbox.RestoreSandbox(ctx, artifact, forkName)
 	if err != nil {
 		t.Fatalf("RestoreSandbox: %v", err)
 	}
@@ -229,11 +229,45 @@ func TestSnapshotCreateAndSnapshotDirectoryOps(t *testing.T) {
 
 	archivePath := filepath.Join(t.TempDir(), "snapshot.tar")
 	phaseStart = time.Now()
-	if err := microsandbox.Snapshot.Save(ctx, snapshotDir, archivePath,
+	if err := artifact.SaveTo(ctx, archivePath,
 		microsandbox.SnapshotSaveOptions{PlainTar: true}); err != nil {
-		t.Fatalf("Snapshot.Save: %v", err)
+		t.Fatalf("SnapshotArtifact.SaveTo: %v", err)
 	}
 	logSnapshotPhase(t, "save snapshot archive", phaseStart)
+
+	copyCtx, cancelCopy := context.WithTimeout(context.Background(), integrationTestTimeout)
+	t.Cleanup(cancelCopy)
+	copiedArchivePath := filepath.Join(t.TempDir(), "copied.tar.zst")
+	phaseStart = time.Now()
+	if err := artifact.CopyTo(copiedArchivePath).
+		Labels(map[string]string{"environment": "test"}).
+		RecordIntegrity(true).
+		Save(copyCtx); err != nil {
+		t.Fatalf("SnapshotArtifact.CopyTo.Save: %v", err)
+	}
+	logSnapshotPhase(t, "copy snapshot archive", phaseStart)
+
+	copiedHandle, err := microsandbox.Snapshot.Load(
+		copyCtx,
+		copiedArchivePath,
+		filepath.Join(t.TempDir(), "copied"),
+	)
+	if err != nil {
+		t.Fatalf("Snapshot.Load copied archive: %v", err)
+	}
+	t.Cleanup(func() {
+		removeSnapshotBestEffort(copiedHandle.Reference())
+	})
+	copied, err := copiedHandle.Open(copyCtx)
+	if err != nil {
+		t.Fatalf("SnapshotHandle.Open copied archive: %v", err)
+	}
+	if got := copied.Labels()["environment"]; got != "test" {
+		t.Fatalf("copied snapshot label = %q, want %q", got, "test")
+	}
+	if _, err := copied.Verify(copyCtx); err != nil {
+		t.Fatalf("SnapshotArtifact.Verify copied archive: %v", err)
+	}
 
 	// VM startup and snapshot export can consume most of the shared test context on busy
 	// self-hosted runners. Keep import independently bounded so it receives the same full
@@ -248,7 +282,7 @@ func TestSnapshotCreateAndSnapshotDirectoryOps(t *testing.T) {
 	}
 	logSnapshotPhase(t, "load snapshot archive", phaseStart)
 	t.Cleanup(func() {
-		removeSnapshotBestEffort(imported.Path())
+		removeSnapshotBestEffort(imported.Reference())
 	})
 	if imported.Digest() != artifact.Digest() {
 		t.Fatalf("Snapshot.Load digest = %q, want %q", imported.Digest(), artifact.Digest())

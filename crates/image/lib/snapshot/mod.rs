@@ -11,7 +11,6 @@ pub mod manifest;
 #[doc(hidden)]
 pub mod migration;
 mod owned;
-mod restore_defaults;
 
 //--------------------------------------------------------------------------------------------------
 // Re-Exports
@@ -26,9 +25,9 @@ pub use manifest::{
     SnapshotFormat, SnapshotId, SnapshotRootDisk, SnapshotScope, SnapshotState, UpperIntegrity,
     UpperLayer, layer_path,
 };
+pub use microsandbox_types::snapshot::{RESTORE_DEFAULTS_EXTENSION, RestoreDefaults};
 pub use owned::{
     OWNED_VOLUMES_EXTENSION, OwnedDirectoryPayload, OwnedMountSnapshot, OwnedVolumeCapture,
     OwnedVolumeData, validate_owned_resources, validate_owned_volumes,
     verify_owned_directory_payloads,
 };
-pub use restore_defaults::{RESTORE_DEFAULTS_EXTENSION, RestoreDefaults};

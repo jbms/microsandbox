@@ -73,7 +73,7 @@ Common flags:
 | `--net` | Add a high-level network profile (`public`, `private`, `host`, `all`, or `none`) |
 | `--net-rule` | Add a network policy rule |
 | `--net-strict` | Require hostname-based network allows to use inspectable request authority. Non-intercepted HTTPS fails closed when only a hostname rule allows it |
-| `--proxy` | Route eligible outbound traffic through a `socks4://IP:PORT` or `socks5://IP:PORT` proxy. Local-only. See [Proxy](#outbound-proxy) |
+| `--proxy` | Route eligible outbound traffic through a `socks4://IP:PORT` or `socks5://IP:PORT` proxy. Local-only. See [Proxies](#outbound-proxy) |
 | `--socks4-user-id` | Optional SOCKS4 user ID. Requires a `socks4://` proxy |
 | `--socks5-username`, `--socks5-password-env` | SOCKS5 username and the host environment variable containing its password. Both flags are required together |
 | `--secret` | Configure `NAME[:OPTIONS]@HOST[,HOST...]`; options control substitution and placeholder passthrough |
@@ -114,7 +114,7 @@ Published ports bind to `127.0.0.1` by default. Use an explicit bind address onl
 
 Use the repeatable `--vsock HOST_PATH:PORT[/stream|/dgram]` flag to expose a host Unix socket or local Windows named pipe on guest host CID `2`. Stream is the default. Datagram routes preserve message boundaries and are unavailable on Windows.
 
-See [VSock](/networking/host-sockets) for guest connection details, limits, and SDK examples.
+See [Host sockets](/networking/host-sockets) for guest connection details, limits, and SDK examples.
 
 ### Network profiles
 
@@ -148,13 +148,13 @@ msb run alpine --proxy socks5://127.0.0.1:1080 \
   --socks5-password-env SOCKS5_PASSWORD
 ```
 
-SOCKS4 carries TCP only. SOCKS5 carries TCP and non-DNS UDP. `--socks5-username` and `--socks5-password-env` must be supplied together and require a `socks5://` proxy. The named environment variable is read from the host when the sandbox starts; the password itself is never placed in the command arguments or durable configuration. Proxy URIs reject user information, paths, query parameters, and fragments. See [Proxy](/networking/outbound-proxy) for routing behavior and limits.
+SOCKS4 carries TCP only. SOCKS5 carries TCP and non-DNS UDP. `--socks5-username` and `--socks5-password-env` must be supplied together and require a `socks5://` proxy. The named environment variable is read from the host when the sandbox starts; the password itself is never placed in the command arguments or durable configuration. Proxy URIs reject user information, paths, query parameters, and fragments. See [Proxies](/networking/outbound-proxy) for routing behavior and limits.
 
 ### Network rule syntax
 
 `--net-rule` takes one or more comma-separated rule tokens. The token grammar is:
 
-```
+```text
 <action>[:<direction>]@<target>[:<proto>[:<ports>]]
 ```
 
@@ -216,7 +216,7 @@ msb create --replace-with-timeout 0 python --name worker    # SIGKILL immediatel
 
 ## msb sandbox restore
 
-Restore a saved snapshot into a new local sandbox. Use `msb restore`, `msb sandbox restore`, or `msb sbx restore`; all three accept the same flags. Full snapshots resume captured processes; disk snapshots boot from the saved disk. Run new commands separately with `msb exec`.
+Restore a saved snapshot into a new sandbox. Use `msb restore`, `msb sandbox restore`, or `msb sbx restore`; all three accept the same flags. Local full snapshots resume captured processes; disk snapshots boot from the saved disk. Cloud supports disk restore but rejects full checkpoints and local-only resource/archive options. Run new commands separately with `msb exec`.
 
 ```bash
 msb restore devbox:ready --name worker --forked
@@ -231,9 +231,22 @@ msb sbx restore ./saved.msb --name disk-copy --disk-only
 | `--disk-only` | Restore only the disk from a full snapshot; conflicts with `--forked` |
 | `--snapshot-base` | Exact base snapshot or archive for a dependent export |
 | `-u`, `--user` | Override the default user for new exec commands |
+| `-c`, `--cpus` | CPU count for disk boot; full restore requires the captured count |
+| `-m`, `--memory` | Memory for disk boot, e.g. `2G`; full restore requires the captured size |
+| `--security` | `default` or `restricted`, applied at disk boot; rejected for full execution restore |
+| `--no-net` | Deny traffic in both directions by default; keeps the captured device and accepts explicit allow rules |
+| `--net-default` | Set both traffic defaults to `allow` or `deny` |
+| `--net-rule` | Repeatable host-policy rule; requires `--net-default` or `--no-net` |
+| `--max-connections` | Concurrent TCP limit; zero explicitly means unlimited |
+| `--max-duration` | Destination sandbox lifetime bound, e.g. `10m` |
+| `--idle-timeout` | Destination inactivity bound, e.g. `2m` |
 | `-q`, `--quiet` | Hide progress, but not unavailable-resource warnings |
 
 Restore progress covers RAM-backing preparation, cache waits/reuse, syncing, and activation. Slow preparation does not consume the activation timeout. `create` and `run` no longer accept `--from-snapshot`.
+
+Disk restore applies destination controls before boot, then leaves the sandbox idle for `msb exec`. Full restore applies host-enforced network policy, connection limits, and lifetime/idle timers, but cannot change the captured guest interface or CPU/RAM geometry. An explicit security profile is rejected for full execution restore because boot-time guest confinement is not replayed; use `--disk-only` when a cold boot is intended. Backend capability checks still apply on cloud.
+
+Restore policy rules replace the complete destination policy only when you explicitly select `--net-default` or `--no-net`; rule-only requests fail instead of silently discarding configured policy. No policy flags retain the configured default. Restore never replaces an existing sandbox or accepts a new startup command: stop and remove an old destination explicitly, and run workloads with `msb exec` after successful restore.
 
 Restore and branch do not reuse host resources by default. Map directories with `-v /host/path:/guest/path`, select a private captured disk with `-v /guest/path`, and publish new listeners with `-p HOST:GUEST`. An unmapped filesystem or additional disk stays present during full restore but backend requests return I/O errors; data already cached in guest RAM may still be readable. Warnings are shown even with `--quiet`. Disk errors can make the guest filesystem abort its journal or become read-only. The root disk is always restored from the snapshot and cannot be omitted. Custom vsock routes are not inherited; use `--vsock HOST_PATH:PORT` to authorize a service for clients to reconnect to.
 
@@ -589,7 +602,7 @@ msb metrics --format json   # One-shot JSON output
 
 | Flag | Description |
 |------|-------------|
-| `-w`, `--watch` | Continuously refresh the table in place. Ctrl-C to quit. Requires a terminal |
+| `-w`, `--watch` | Continuously refresh the table in place. Ctrl+C to quit. Requires a terminal |
 | `-f`, `--follow` | Stream one JSON Lines object per sandbox per interval to stdout |
 | `--interval` | Refresh interval for `--watch`/`--follow` (e.g. `500ms`, `2s`). Default `1s` |
 | `-a`, `--all` | Include `exited` rows: terminal metrics preserved in the registry until the slot is reused |
@@ -732,4 +745,4 @@ On Linux x86 hosts, `msb doctor` reports the applicable KVM interrupt-accelerati
 
 Doctor also runs a short-lived clone probe inside `MSB_HOME` and reports whether flat-root `clone=auto` resolves to a native reflink or the portable sparse-copy fallback. The probe files are removed immediately and no host configuration is changed.
 
-See [Optimization](/sandboxes/optimization) for interpreting these checks, choosing sandbox-level policies, and preparing the host storage and virtualization environment.
+See [Performance](/sandboxes/optimization) for interpreting these checks, choosing sandbox-level policies, and preparing the host storage and virtualization environment.

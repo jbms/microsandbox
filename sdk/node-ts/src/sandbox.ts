@@ -24,6 +24,7 @@ import {
   type NapiSandboxConfig,
   type NapiSandboxListOptions,
   type NapiSandboxPage,
+  type NapiSnapshotSeed,
 } from "./internal/napi.js";
 import { ExecHandle, ExecOutput } from "./exec.js";
 import { SandboxFsOps } from "./fs.js";
@@ -219,8 +220,10 @@ export class CreationProgressCreate {
 
 export class Sandbox implements AsyncDisposable {
   /** Prepare restoration; no VM starts until the builder's restore terminal. */
-  static restore(snapshot: string): RestoreBuilder {
-    const builder = new napi.RestoreBuilder(snapshot);
+  static restore(snapshot: NapiSnapshotSeed): RestoreBuilder {
+    const builder = typeof snapshot === "string"
+      ? new napi.RestoreBuilder(snapshot)
+      : new napi.RestoreBuilder(snapshot.reference, snapshot.referenceKind);
     const restore = builder.restore.bind(builder);
     const progress = builder.restoreWithProgress.bind(builder);
     let name = "";

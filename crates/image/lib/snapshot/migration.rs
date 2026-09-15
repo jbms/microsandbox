@@ -536,22 +536,16 @@ pub fn translate_released_flat_reverse(
 //--------------------------------------------------------------------------------------------------
 
 fn legacy_snapshot_id(digest: &str) -> ImageResult<SnapshotId> {
-    let hex = digest.strip_prefix("sha256:").ok_or_else(|| {
-        ImageError::ManifestParse("legacy descriptor digest is not sha256".into())
-    })?;
-    SnapshotId::new(format!("snap_{}", &hex[..32]))
+    Ok(microsandbox_types::snapshot::legacy::snapshot_id(digest)?)
 }
 
 fn legacy_layer_id(digest: &str) -> ImageResult<DiskLayerId> {
-    let hex = digest.strip_prefix("sha256:").ok_or_else(|| {
-        ImageError::ManifestParse("legacy descriptor digest is not sha256".into())
-    })?;
-    DiskLayerId::new(format!("layer_{}", &hex[32..64]))
+    Ok(microsandbox_types::snapshot::legacy::layer_id(digest)?)
 }
 
 fn legacy_or_final_snapshot_id(value: &str) -> ImageResult<SnapshotId> {
     if value.starts_with("snap_") {
-        SnapshotId::new(value)
+        Ok(SnapshotId::new(value)?)
     } else {
         legacy_snapshot_id(value)
     }
@@ -751,6 +745,26 @@ mod tests {
         let round_trip = translate_released_flat_forward(&reversed.target_bytes).unwrap();
 
         assert_eq!(round_trip.source_digest, reversed.target_digest);
+        // A cloud SDK's normalized view and a local import must agree for the
+        // same released descriptor while retaining its original wire digest.
+        let cloud = microsandbox_types::snapshot::cloud_manifest::Manifest::from_bytes(
+            &reversed.target_bytes,
+        )
+        .unwrap();
+        let projected = microsandbox_types::snapshot::legacy::project_cloud_descriptor(
+            &cloud,
+            &reversed.target_digest,
+        )
+        .unwrap();
+        assert_eq!(projected, round_trip.target);
+        assert_eq!(cloud.digest().unwrap(), reversed.target_digest);
+        assert!(
+            microsandbox_types::snapshot::legacy::project_cloud_descriptor(
+                &cloud,
+                &format!("sha256:{}", "f".repeat(64)),
+            )
+            .is_err()
+        );
         assert_eq!(round_trip.upper_file, DEFAULT_UPPER_FILE);
         let round_trip_file = round_trip.target.state.as_file().unwrap();
         let translated_file = translated.target.state.as_file().unwrap();

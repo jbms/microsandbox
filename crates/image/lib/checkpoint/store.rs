@@ -1,7 +1,6 @@
 //! Crash-safe local immutable-object storage.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -9,7 +8,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use crate::error::{ImageError, ImageResult};
@@ -27,10 +25,7 @@ const MERKLE_ROOT_DOMAIN: &[u8] = b"microsandbox.checkpoint-file/1\0root\0";
 // Types
 //--------------------------------------------------------------------------------------------------
 
-/// Algorithm-qualified immutable object identity.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct ObjectId(String);
+pub use microsandbox_types::snapshot::disk::ObjectId;
 
 /// Filesystem-backed content-addressed object store.
 #[derive(Clone, Debug)]
@@ -109,44 +104,6 @@ struct MerkleAccumulator {
 //--------------------------------------------------------------------------------------------------
 // Methods
 //--------------------------------------------------------------------------------------------------
-
-impl ObjectId {
-    /// Compute an identity from exact bytes.
-    pub fn from_bytes(bytes: &[u8]) -> ImageResult<Self> {
-        let mut hasher = Sha256::new();
-        hasher.update(bytes);
-        Self::new(format!("sha256:{}", hex::encode(hasher.finalize())))
-    }
-
-    /// Parse and validate an algorithm-qualified identity.
-    pub fn new(value: impl Into<String>) -> ImageResult<Self> {
-        let value = value.into();
-        let Some(encoded) = value.strip_prefix("sha256:") else {
-            return Err(ImageError::ManifestParse(
-                "object identity must use sha256".into(),
-            ));
-        };
-        if encoded.len() != 64
-            || !encoded
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        {
-            return Err(ImageError::ManifestParse(format!(
-                "invalid object identity: {value}"
-            )));
-        }
-        Ok(Self(value))
-    }
-
-    /// Return the qualified identity.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    fn hex(&self) -> &str {
-        self.0.strip_prefix("sha256:").expect("validated identity")
-    }
-}
 
 impl LocalObjectStore {
     /// Open or create a local object store rooted at `root`.
@@ -587,26 +544,6 @@ impl MerkleAccumulator {
 //--------------------------------------------------------------------------------------------------
 // Trait Implementations
 //--------------------------------------------------------------------------------------------------
-
-impl fmt::Display for ObjectId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-impl TryFrom<String> for ObjectId {
-    type Error = ImageError;
-
-    fn try_from(value: String) -> Result<Self, Self::Error> {
-        Self::new(value)
-    }
-}
-
-impl From<ObjectId> for String {
-    fn from(value: ObjectId) -> Self {
-        value.0
-    }
-}
 
 //--------------------------------------------------------------------------------------------------
 // Functions: Helpers

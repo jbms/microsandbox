@@ -59,16 +59,16 @@ func CreateSandboxWithProgress(ctx context.Context, name string, opts ...Sandbox
 }
 
 // RestoreSandboxWithProgress restores a detached sandbox with bounded progress events.
-func RestoreSandboxWithProgress(ctx context.Context, snapshot, name string, opts ...RestoreOption) (<-chan CreationProgress, <-chan CreationResult) {
+func RestoreSandboxWithProgress[T SnapshotSeed](ctx context.Context, snapshot T, name string, opts ...RestoreOption) (<-chan CreationProgress, <-chan CreationResult) {
 	return sandboxWithProgress(ctx, func(id uint64) (*ffi.Sandbox, error) {
 		config := RestoreConfig{}
 		for _, opt := range opts {
 			opt(&config)
 		}
-		options := buildFFIRestoreOptions(snapshot, config)
-		if err := validateOwnedMounts(config.Volumes); err != nil {
+		if err := validateRestoreConfig(config); err != nil {
 			return nil, err
 		}
+		options := buildFFIRestoreOptions(snapshot, config)
 		options.CreationProgress = id
 		return ffi.RestoreSandbox(ctx, name, options)
 	})

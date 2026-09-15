@@ -2298,8 +2298,52 @@ pub(crate) fn push_guest_frame_until(
     }
 }
 
-/// The VMM shutdown observer is synchronous. Reuse the ordinary queue and its admission receipt
-/// without blocking Tokio's channel APIs or bypassing a frozen/credit-starved FIFO head.
+/// Await the same ordered admission without occupying the worker that must run the writer.
+///
+/// The receipt acknowledges a push into the guest transport, not guest shutdown completion.
+/// Timing out after queue acceptance does not retract the frame: the existing writer still owns it.
+pub(crate) async fn push_guest_frame_until_async(
+    shared: &Arc<ConsoleSharedState>,
+    frame: Vec<u8>,
+    timeout: std::time::Duration,
+) -> RuntimeResult<()> {
+    let Some(writer) = shared
+        .workload_control
+        .ordinary_writer()
+        .map_err(RuntimeError::Custom)?
+    else {
+        // Preserve bootstrap's pre-Ready path without blocking an async worker. Recheck readiness
+        // inside the synchronous helper, since Ready may arrive before this offload starts.
+        // Once dispatched, this bounded offload owns the request even if its waiter is canceled.
+        let shared = Arc::clone(shared);
+        return tokio::task::spawn_blocking(move || {
+            push_guest_frame_until(&shared, frame, timeout)
+        })
+        .await
+        .map_err(|error| RuntimeError::Custom(format!("guest frame sender failed: {error}")))?;
+    };
+    let (completion, completed) = oneshot::channel();
+    let write = ControlWrite {
+        completion: Some(completion),
+        ..Bytes::from(frame).into()
+    };
+    // One deadline includes both bounded-queue admission and physical delivery. Keeping the
+    // ordinary writer preserves its global fence, pause gate, and transport-credit accounting.
+    tokio::time::timeout(timeout, async {
+        writer
+            .send(write)
+            .await
+            .map_err(|_| RuntimeError::Custom("agent control writer stopped".into()))?;
+        completed.await.map_err(|_| {
+            RuntimeError::Custom("agent control writer dropped admission receipt".into())
+        })
+    })
+    .await
+    .map_err(|_| RuntimeError::Custom("timed out sending ordered frame to agentd".into()))?
+}
+
+/// The parent-watch thread is synchronous. Reuse the ordinary queue and its admission receipt
+/// without bypassing a frozen/credit-starved FIFO head. Async callers must use the async helper.
 fn push_ordered_guest_frame_until(
     shared: &ConsoleSharedState,
     writer: &ControlWriter,
@@ -8296,6 +8340,301 @@ mod tests {
         writer.abort();
         let _ = writer.await;
         gate.release();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_shutdown_yields_to_writer_and_preserves_counted_fifo() {
+        let shared = workload_test_shared(4096, false);
+        let control = Arc::clone(&shared.workload_control);
+        let (tx, rx) = ControlWriter::new();
+        control.register_ordinary_writer(tx.clone());
+        let writer = tokio::spawn(ring_writer_task(Arc::clone(&shared), rx));
+        tokio::task::yield_now().await; // Let the real writer register as active.
+        let first = Bytes::from(encoded_message_id(MessageType::Ping, 1, &()));
+        tx.send(first.clone().into()).await.unwrap();
+        let shutdown = encoded_message_id(MessageType::Shutdown, 0, &());
+        let expected_bytes = first.len() + shutdown.len();
+        let guest_shared = Arc::clone(&shared);
+        let guest = tokio::spawn(async move {
+            // This small fixture has one physical queue entry. Model guest consumption so
+            // the later shutdown can enter that queue without weakening FIFO admission.
+            [
+                next_host_fragment(&guest_shared).await,
+                next_host_fragment(&guest_shared).await,
+            ]
+        });
+
+        // There is no second worker to rescue a blocking sender. This direct await must let
+        // the writer process both the earlier frame and the shutdown's admission receipt.
+        push_guest_frame_until_async(&shared, shutdown, std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        let [observed_first, observed_shutdown] = guest.await.unwrap();
+        assert_eq!(observed_first, first);
+        assert_eq!(
+            decode_frame(&observed_shutdown).unwrap().t,
+            MessageType::Shutdown
+        );
+        assert!(shared.rx_ring.pop().is_none());
+        let gate = control.gate();
+        let position = control.parked_position().await.unwrap();
+        assert_eq!(position.control_frames, 2);
+        assert_eq!(position.control_bytes, expected_bytes as u64);
+        gate.release();
+        writer.abort();
+        let _ = writer.await;
+    }
+
+    #[tokio::test]
+    async fn async_shutdown_timeout_preserves_gated_accepted_frame() {
+        let shared = workload_test_shared(4096, false);
+        let control = Arc::clone(&shared.workload_control);
+        let (tx, rx) = ControlWriter::new();
+        control.register_ordinary_writer(tx);
+        let writer = tokio::spawn(ring_writer_task(Arc::clone(&shared), rx));
+        let gate = control.gate();
+        control.parked_position().await.unwrap();
+        let result = push_guest_frame_until_async(
+            &shared,
+            encoded_message_id(MessageType::Shutdown, 0, &()),
+            std::time::Duration::from_millis(20),
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        assert!(shared.rx_ring.pop().is_none());
+        // A caller timing out never retracts accepted input or bypasses a resident pause.
+        gate.release();
+        assert_eq!(
+            decode_frame(&next_host_fragment(&shared).await).unwrap().t,
+            MessageType::Shutdown
+        );
+        assert!(shared.rx_ring.pop().is_none());
+        writer.abort();
+        let _ = writer.await;
+    }
+
+    #[tokio::test]
+    async fn async_shutdown_waits_for_ring_capacity_not_just_queue_acceptance() {
+        let shared = workload_test_shared(128, false);
+        let control = Arc::clone(&shared.workload_control);
+        let (tx, rx) = ControlWriter::new();
+        control.register_ordinary_writer(tx);
+        shared.rx_ring.push(Bytes::from(vec![7; 128])).unwrap();
+        let writer = tokio::spawn(ring_writer_task(Arc::clone(&shared), rx));
+        tokio::task::yield_now().await;
+        let sender = Arc::clone(&shared);
+        let delivery = tokio::spawn(async move {
+            push_guest_frame_until_async(
+                &sender,
+                encoded_message_id(MessageType::Shutdown, 0, &()),
+                std::time::Duration::from_secs(1),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(!delivery.is_finished(), "queue acceptance is not delivery");
+        assert_eq!(next_host_fragment(&shared).await.as_ref(), &[7; 128]);
+        delivery.await.unwrap().unwrap();
+        assert_eq!(
+            decode_frame(&next_host_fragment(&shared).await).unwrap().t,
+            MessageType::Shutdown
+        );
+        writer.abort();
+        let _ = writer.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn async_shutdown_shares_one_deadline_and_releases_unaccepted_permits() {
+        let shared = workload_test_shared(4096, false);
+        let control = Arc::clone(&shared.workload_control);
+        let _private = control.start();
+        let (tx, mut rx) = ControlWriter::new();
+        control.register_ordinary_writer(tx.clone());
+        let held = Arc::clone(&tx.control_bytes)
+            .acquire_many_owned((AGENT_WRITE_CONTROL_BYTES - 1) as u32)
+            .await
+            .unwrap();
+        let result = push_guest_frame_until_async(
+            &shared,
+            encoded_message_id(MessageType::Shutdown, 0, &()),
+            std::time::Duration::from_millis(10),
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+        assert_eq!(
+            tx.control_frames.available_permits(),
+            AGENT_WRITE_CLASS_FRAMES
+        );
+        assert_eq!(tx.control_bytes.available_permits(), 1);
+        assert!(rx.try_recv().is_err());
+
+        let sender = Arc::clone(&shared);
+        let delivery = tokio::spawn(async move {
+            push_guest_frame_until_async(
+                &sender,
+                encoded_message_id(MessageType::Shutdown, 0, &()),
+                std::time::Duration::from_millis(40),
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_millis(20)).await;
+        drop(held);
+        let accepted = rx.recv().await.unwrap();
+        assert!(matches!(accepted.order, ControlOrder::GlobalFence));
+        tokio::time::advance(std::time::Duration::from_millis(21)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            delivery.is_finished(),
+            "receipt wait must not restart the deadline"
+        );
+        assert!(
+            delivery
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("timed out")
+        );
+        drop(accepted);
+        assert_eq!(
+            tx.control_frames.available_permits(),
+            AGENT_WRITE_CLASS_FRAMES
+        );
+        assert_eq!(
+            tx.control_bytes.available_permits(),
+            AGENT_WRITE_CONTROL_BYTES
+        );
+    }
+
+    #[tokio::test]
+    async fn async_shutdown_reports_dropped_receipt_and_receiver() {
+        let shared = workload_test_shared(4096, false);
+        let control = Arc::clone(&shared.workload_control);
+        let _private = control.start();
+        let (tx, mut rx) = ControlWriter::new();
+        control.register_ordinary_writer(tx);
+        let sender = Arc::clone(&shared);
+        let delivery = tokio::spawn(async move {
+            push_guest_frame_until_async(
+                &sender,
+                encoded_message_id(MessageType::Shutdown, 0, &()),
+                std::time::Duration::from_secs(60),
+            )
+            .await
+        });
+        drop(rx.recv().await.unwrap());
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), delivery)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("dropped admission receipt"));
+        drop(rx);
+        let result = push_guest_frame_until_async(
+            &shared,
+            encoded_message_id(MessageType::Shutdown, 0, &()),
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("writer stopped"));
+    }
+
+    #[tokio::test]
+    async fn async_shutdown_cancellation_keeps_accepted_frame_behind_credit() {
+        use microsandbox_protocol::core::{WorkloadTransportCredit, WorkloadTransportPosition};
+        let shared = workload_test_shared(4096, false);
+        let control = Arc::clone(&shared.workload_control);
+        control
+            .restore(
+                WorkloadTransportPosition::default(),
+                WorkloadTransportCredit::default(),
+                0,
+            )
+            .unwrap();
+        let (tx, rx) = ControlWriter::new();
+        control.register_ordinary_writer(tx.clone());
+        let writer = tokio::spawn(ring_writer_task(Arc::clone(&shared), rx));
+        tokio::task::yield_now().await;
+        let sender = Arc::clone(&shared);
+        let delivery = tokio::spawn(async move {
+            push_guest_frame_until_async(
+                &sender,
+                encoded_message_id(MessageType::Shutdown, 0, &()),
+                std::time::Duration::from_secs(1),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while tx.control_frames.available_permits() == AGENT_WRITE_CLASS_FRAMES {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!delivery.is_finished());
+        assert!(
+            shared.rx_ring.pop().is_none(),
+            "shutdown cannot bypass credit"
+        );
+        delivery.abort();
+        let _ = delivery.await;
+        control
+            .update_credit(WorkloadTransportCredit {
+                control_bytes: 4096,
+                control_frames: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            decode_frame(&next_host_fragment(&shared).await).unwrap().t,
+            MessageType::Shutdown
+        );
+        assert!(shared.rx_ring.pop().is_none());
+        assert_eq!(
+            tx.control_frames.available_permits(),
+            AGENT_WRITE_CLASS_FRAMES
+        );
+        writer.abort();
+        let _ = writer.await;
+    }
+
+    #[tokio::test]
+    async fn async_shutdown_ready_without_writer_never_uses_bootstrap_fallback() {
+        let shared = workload_test_shared(4096, false);
+        let result = push_guest_frame_until_async(
+            &shared,
+            encoded_message_id(MessageType::Shutdown, 0, &()),
+            std::time::Duration::ZERO,
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("not running"));
+        assert!(shared.rx_ring.pop().is_none());
+        let pre_ready = Arc::new(ConsoleSharedState::with_capacity(4096));
+        push_guest_frame_until_async(&pre_ready, vec![1, 2, 3], std::time::Duration::ZERO)
+            .await
+            .unwrap();
+        assert_eq!(pre_ready.rx_ring.pop().unwrap().as_ref(), &[1, 2, 3]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn async_shutdown_bootstrap_backpressure_leaves_guest_consumer_runnable() {
+        let shared = Arc::new(ConsoleSharedState::with_capacity(128));
+        shared.rx_ring.push(Bytes::from(vec![7; 128])).unwrap();
+        let guest_shared = Arc::clone(&shared);
+        let guest = tokio::spawn(async move {
+            // No writer exists before Ready. Even this fallback must yield the only async
+            // worker so a guest-side consumer can release the full bootstrap queue.
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            assert_eq!(next_host_fragment(&guest_shared).await.as_ref(), &[7; 128]);
+            next_host_fragment(&guest_shared).await
+        });
+        let shutdown = encoded_message_id(MessageType::Shutdown, 0, &());
+        push_guest_frame_until_async(&shared, shutdown.clone(), std::time::Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(guest.await.unwrap().as_ref(), shutdown);
+        assert!(shared.rx_ring.pop().is_none());
     }
 
     #[test]

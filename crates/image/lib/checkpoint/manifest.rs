@@ -97,47 +97,7 @@ pub struct MemoryManifest {
     pub extents: Vec<MemoryExtent>,
 }
 
-/// One immutable disk layer in a complete oldest-first dependency closure.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DiskLayerRef {
-    /// Stable layer identity.
-    pub layer_id: String,
-    /// Physical format (`raw` or `qcow2`).
-    pub format: String,
-    /// Guest-visible virtual size.
-    pub virtual_size: u64,
-    /// Exact physical file length; checked even when content integrity is not recorded.
-    pub file_size: u64,
-    /// Immediate predecessor when present.
-    pub predecessor: Option<String>,
-    /// Optional content integrity of the exact physical layer, independent of layer identity.
-    pub integrity_root: Option<String>,
-}
-
-/// Immutable sealed disk generation.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DiskGenerationManifest {
-    /// Schema identifier.
-    pub schema: String,
-    /// Logical writable volume identity.
-    pub volume_id: String,
-    /// Stable guest-visible block device whose bytes this generation captures.
-    #[serde(
-        default = "default_root_disk_device_id",
-        skip_serializing_if = "is_default_root_disk_device_id"
-    )]
-    pub device_id: String,
-    /// Monotonic immutable generation.
-    pub generation: u64,
-    /// Complete oldest-first physical closure.
-    pub layers: Vec<DiskLayerRef>,
-    /// Layer identity of the sealed head.
-    pub head: String,
-    /// VM-wide pause boundary at which the writable head was sealed.
-    pub pause_generation: u64,
-}
+pub use microsandbox_types::snapshot::disk::{DiskGenerationManifest, DiskLayerRef};
 
 /// Treatment selected for a runtime resource.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -242,66 +202,6 @@ impl MemoryManifest {
     }
 }
 
-impl DiskGenerationManifest {
-    fn validate_body(&self) -> ImageResult<()> {
-        if !portable_member_id(&self.volume_id)
-            || !portable_member_id(&self.device_id)
-            || self.generation == 0
-            || self.layers.is_empty()
-        {
-            return manifest_error("disk generation has invalid identity, generation, or layers");
-        }
-        if self.layers.len() > 256 {
-            return manifest_error("disk generation exceeds 256 layers");
-        }
-        if self.layers.last().map(|layer| layer.layer_id.as_str()) != Some(self.head.as_str()) {
-            return manifest_error("disk head does not name the final layer");
-        }
-        for (index, layer) in self.layers.iter().enumerate() {
-            if !portable_member_id(&layer.layer_id)
-                || layer.virtual_size == 0
-                || layer.file_size == 0
-            {
-                return manifest_error("disk layer has invalid identity or zero virtual size");
-            }
-            if let Some(root) = &layer.integrity_root {
-                validate_blake3_root(root)?;
-            }
-            match (index, layer.format.as_str(), layer.predecessor.as_deref()) {
-                (0, "raw" | "qcow2", None) => {}
-                (_, "qcow2", Some(parent))
-                    if parent == self.layers[index - 1].layer_id.as_str() => {}
-                _ => return manifest_error("disk layer closure is not a valid oldest-first chain"),
-            }
-        }
-        Ok(())
-    }
-}
-
-fn validate_blake3_root(root: &str) -> ImageResult<()> {
-    let Some(encoded) = root.strip_prefix("blake3:") else {
-        return manifest_error("disk layer integrity must use blake3");
-    };
-    if encoded.len() != 64
-        || !encoded
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return manifest_error("disk layer integrity has an invalid digest");
-    }
-    Ok(())
-}
-
-fn portable_member_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value != "."
-        && value != ".."
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-}
-
 impl CheckpointManifest {
     fn validate_body(&self) -> ImageResult<()> {
         if self.checkpoint_id.is_empty() || self.architecture.is_empty() {
@@ -355,14 +255,6 @@ impl CheckpointManifest {
 //--------------------------------------------------------------------------------------------------
 // Functions: Helpers
 //--------------------------------------------------------------------------------------------------
-
-fn default_root_disk_device_id() -> String {
-    "vdb".into()
-}
-
-fn is_default_root_disk_device_id(value: &str) -> bool {
-    value == "vdb"
-}
 
 fn validate_extents(extents: &[MemoryExtent]) -> ImageResult<()> {
     let mut previous_end = 0u64;
@@ -426,12 +318,6 @@ impl Validate for MemoryManifest {
     }
 }
 
-impl Validate for DiskGenerationManifest {
-    fn validate_manifest(&self) -> ImageResult<()> {
-        self.validate()
-    }
-}
-
 impl Validate for CheckpointManifest {
     fn validate_manifest(&self) -> ImageResult<()> {
         self.validate()
@@ -477,14 +363,13 @@ macro_rules! manifest_methods {
 
             /// Compute the immutable SHA-256 identity of canonical bytes.
             pub fn digest(&self) -> ImageResult<ObjectId> {
-                ObjectId::from_bytes(&self.to_canonical_bytes()?)
+                Ok(ObjectId::from_bytes(&self.to_canonical_bytes()?)?)
             }
         }
     };
 }
 
 manifest_methods!(MemoryManifest, "microsandbox.memory/1");
-manifest_methods!(DiskGenerationManifest, "microsandbox.disk-generation/1");
 manifest_methods!(CheckpointManifest, "microsandbox.checkpoint/1");
 
 //--------------------------------------------------------------------------------------------------

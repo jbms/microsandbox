@@ -156,6 +156,16 @@ handle.wait_for_status(status) # => SandboxHandle
 
 Wait until this exact sandbox reaches `status`, returning a refreshed handle. The method does not have a built-in timeout.
 
+#### <span className="msb-recv">handle.</span><span className="msb-hn">stop()</span>
+
+<Tooltip tip="On Cloud, the timeout only limits how long the SDK waits; the accepted stop may continue server-side."><span className="msb-badge-limited">Different on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
+
+```ruby
+handle.stop(timeout: nil) # => nil
+```
+
+Gracefully shut down with the same Local and Cloud timeout behavior as `Sandbox#stop`.
+
 #### <span className="msb-recv">handle.</span><span className="msb-hn">restart()</span>
 
 ```ruby

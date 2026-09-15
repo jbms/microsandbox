@@ -53,10 +53,10 @@ msb snapshot create cp01 --from-sandbox worker --full
 msb snapshot create cp02 --from-sandbox worker --full
 
 # A bare group selects its head, currently cp02.
-msb create --name latest --from-snapshot worker --forked
+msb restore worker --name latest --forked
 
 # A qualified name selects an exact checkpoint.
-msb create --name earlier --from-snapshot worker:cp01 --forked
+msb restore worker:cp01 --name earlier --forked
 
 # You can choose a different group, or let a member name be generated.
 msb snapshot create --from-sandbox worker --group experiments --full
@@ -116,7 +116,7 @@ msb snapshot save worker:cp02 checkpoints/cp02.msb --since worker:cp01
 
 # On the destination machine:
 msb snapshot load checkpoints/*.msb --group received
-msb create --name restored --from-snapshot received --forked
+msb restore received --name restored --forked
 ```
 
 The shell expands `*.msb` into archive paths. Their order and filenames do not determine ancestry or load order. You can also list them explicitly, in any order:

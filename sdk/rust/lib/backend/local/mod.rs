@@ -18,6 +18,13 @@
 mod control;
 mod control_lookup;
 mod sandbox;
+pub(crate) mod snapshot;
+
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub use snapshot::archive::fuzz_unpack_local_snapshot_archive;
+#[doc(hidden)]
+pub use snapshot::downgrade as snapshot_downgrade;
 
 pub(crate) use control::ControlSession;
 
@@ -41,7 +48,7 @@ use tokio::sync::OnceCell;
 use super::{
     Backend, BackendInfo, BackendKind, BackendSelectionSource, SandboxBackend, VolumeBackend,
 };
-use crate::{MicrosandboxError, MicrosandboxResult};
+use crate::{MicrosandboxError, MicrosandboxResult, backend::SnapshotBackend};
 use crate::{
     SandboxConfig,
     config::{DatabaseConfig, GlobalConfig, RegistryEntry, load_persisted_config_or_default},
@@ -602,6 +609,10 @@ impl Backend for LocalBackend {
         self
     }
 
+    fn snapshots(&self) -> &dyn SnapshotBackend {
+        self
+    }
+
     fn as_local(&self) -> Option<&LocalBackend> {
         Some(self)
     }
@@ -718,8 +729,7 @@ async fn connect_and_migrate(
         microsandbox_runtime::maintenance::acquire_install_exclusive_lease(pools.write())
             .await
             .map_err(|err| MicrosandboxError::Runtime(err.to_string()))?;
-    let reconcile_result =
-        crate::snapshot::migration::reconcile_managed(&pools, snapshots_dir).await;
+    let reconcile_result = snapshot::migration::reconcile_managed(&pools, snapshots_dir).await;
     let clear_result = microsandbox_runtime::maintenance::clear_install_exclusive_lease(
         pools.write(),
         &install_lease,
@@ -834,7 +844,7 @@ fn is_missing_migrations_table(err: &DbErr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use microsandbox_image::snapshot::Manifest;
+    use microsandbox_types::snapshot::Manifest;
     use microsandbox_types::{
         CpuPlacement, MemoryPlacement, NumaPlacement, PlacementProfile, SandboxResourcesPatch,
     };

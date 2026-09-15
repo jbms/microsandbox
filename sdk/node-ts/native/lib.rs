@@ -36,6 +36,7 @@ mod setup;
 mod shared_handle;
 mod snapshot;
 mod snapshot_builder;
+mod snapshot_copy_builder;
 mod ssh;
 mod tls_builder;
 mod types;

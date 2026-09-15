@@ -4,12 +4,16 @@ description: Capture a sandbox's disk or full execution state as a portable arti
 icon: "code-branch"
 ---
 
-<Tooltip tip="Disk snapshots are local-only. On microsandbox cloud, use a named volume for state that must survive sandbox replacement."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+<Tooltip tip="Cloud supports stopped or crashed disk snapshots and disk restore. Live capture, full checkpoints, branching, groups, and local artifact archives remain local-only."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
 
-A snapshot is a portable artifact that can hold either a sandbox's writable disk state or a full checkpoint of a running sandbox. Managed and flat OCI roots are supported; the descriptor preserves the root layout so a flat `rootfs.raw` is never mistaken for a managed OverlayFS upper. Move it with `scp`, archive it as `.msb`, or create a child sandbox from it.
+A local snapshot is a portable artifact that can hold either a sandbox's writable disk state or a full checkpoint of a running sandbox. Managed and flat OCI roots are supported; the descriptor preserves the root layout so a flat `rootfs.raw` is never mistaken for a managed OverlayFS upper. Move it with `scp`, archive it as `.msb`, or create a child sandbox from it. Cloud disk snapshots use managed storage or the organization's host volume and support create, get, list, open, remove, and dedicated disk restore. Local-only options are rejected explicitly.
 
 <Note>
-Disk snapshots work with running, paused, stopped, or crashed sandboxes. A running disk capture briefly pauses the VM, seals its disk, and resumes it without copying RAM. Full snapshots use `--full` to include memory and execution state. A user-paused source stays paused in either mode.
+Local disk snapshots work with running, paused, stopped, or crashed sandboxes. A running disk capture briefly pauses the VM, seals its disk, and resumes it without copying RAM. Full snapshots use `--full` to include memory and execution state. A user-paused source stays paused in either mode. Cloud disk capture requires a stopped or crashed source.
+</Note>
+
+<Note>
+Snapshot objects expose a backend-neutral `reference` and reference kind. Pass the snapshot object directly where supported, or pass its typed reference to the dedicated restore API. The local `path` accessor remains available but fails for cloud snapshots, whose storage is not on the client host. A reference preserves addressing; it does not make local-only restore options available on cloud.
 </Note>
 
 ## What gets captured
@@ -512,7 +516,7 @@ msb snapshot reindex
 
 `list` uses a rebuildable local index; group/head selection comes from the artifacts on disk. If the index gets out of sync, `reindex` rebuilds it. Global ID or digest lookup refuses ambiguity when several local copies exist—use a group selector or explicit path. `--force` does not bypass the current-head removal guard.
 
-## Move snapshots between machines
+## Move local snapshots between machines
 
 The snapshot directory is the whole artifact; there is no hidden daemon state. Copy the directory directly, or save it as an archive:
 
@@ -550,6 +554,50 @@ snapshots/
 ```
 
 `metadata.json` contains mutable local labels and does not participate in the descriptor digest or snapshot identity. The descriptor names each layer by `DiskLayerId`. Once a full snapshot has rolled the sandbox onto qcow2, a later disk snapshot carries the complete oldest-first raw/qcow2 chain in this same artifact family; archive save/load and direct archive restore preserve every member.
+
+### Copy an archive with new metadata
+
+The SDKs can package the same disk data into a new archive while replacing its
+labels and choosing whether to record integrity. The original snapshot and
+archive are not modified. This direct artifact operation is currently
+local-only; cloud backends return a typed unsupported-operation error.
+
+<CodeGroup>
+```typescript TypeScript
+await snapshot
+  .copyTo("/tmp/snapshot-copy.tar.zst")
+  .labels({ environment: "test" })
+  .recordIntegrity(true)
+  .save();
+```
+
+```rust Rust
+use std::collections::BTreeMap;
+
+let copied = snapshot
+    .copy_to("/tmp/snapshot-copy.tar.zst")
+    .labels(BTreeMap::from([("environment".into(), "test".into())]))
+    .record_integrity(true)
+    .save()
+    .await?;
+```
+
+```python Python
+await (
+    snapshot.copy_to("/tmp/snapshot-copy.tar.zst")
+    .labels({"environment": "test"})
+    .record_integrity(True)
+    .save()
+)
+```
+
+```go Go
+err := snapshot.CopyTo("/tmp/snapshot-copy.tar.zst").
+    Labels(map[string]string{"environment": "test"}).
+    RecordIntegrity(true).
+    Save(ctx)
+```
+</CodeGroup>
 
 ## Integrity verification
 

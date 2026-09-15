@@ -41,7 +41,7 @@ export interface NativeBindings {
   readonly defaultBackendInfo?: () => NapiBackendInfo;
   readonly Sandbox: NapiSandboxStatic;
   readonly SandboxBuilder: NapiSandboxBuilderCtor;
-  readonly RestoreBuilder: new (snapshot: string) => NapiRestoreBuilder;
+  readonly RestoreBuilder: new (snapshot: string, referenceKind?: "auto" | "id" | "path") => NapiRestoreBuilder;
   readonly Volume: NapiVolumeStatic;
   readonly VolumeBuilder: NapiVolumeBuilderCtor;
   readonly Snapshot: NapiSnapshotStatic;
@@ -161,6 +161,12 @@ export interface NapiSandboxStatic {
 }
 
 export type NapiSandboxBuilderCtor = new (name: string) => NapiSandboxBuilder;
+export type NapiSnapshotSeed =
+  | string
+  | {
+      readonly reference: string;
+      readonly referenceKind: "id" | "path";
+    };
 
 /** The auto-generated native SandboxBuilder class. Each setter mutates
  * in place and returns `this`; closure-callback sub-builders are typed
@@ -253,9 +259,21 @@ export interface NapiSandboxBuilder extends NapiSandboxBuilderSetters {
   createWithProgress(): Promise<NapiPullProgressCreate>;
 }
 
-/** Restore exposes destination bindings, never fresh-boot configuration. */
+/** Restore exposes destination controls, never image or startup-command selection. */
 export interface NapiRestoreBuilderSetters {
   name(name: string): this;
+  /** Full execution restore requires captured CPU and memory geometry. */
+  cpus(count: number): this;
+  memory(mib: number): this;
+  /** Host policy only: does not configure DNS, TLS, or guest bootstrap. */
+  networkPolicy(policy: NetworkPolicy | NapiNetworkPolicyBuilder): this;
+  maxConnections(count: number): this;
+  /** Full execution restore rejects removing a captured NIC. */
+  disableNetwork(): this;
+  /** Requires disk scope or diskOnly(); full execution rejects even explicit default. */
+  security(profile: "default" | "restricted"): this;
+  maxDuration(secs: number): this;
+  idleTimeout(secs: number): this;
   forked(): this;
   diskOnly(): this;
   snapshotBase(base: string): this;
@@ -273,6 +291,8 @@ export interface NapiRestoreBuilderSetters {
 }
 
 export interface NapiRestoreBuilder extends NapiRestoreBuilderSetters {
+  networkPolicyJson(json: string): this;
+  networkPolicyFromBuilder(builder: NapiNetworkPolicyBuilder): this;
   restore(): Promise<NapiSandbox>;
   restoreWithProgress(): Promise<NapiPullProgressCreate>;
 }
@@ -646,6 +666,7 @@ export interface NapiSnapshotBuilderSetters {
   full(): this;
 }
 
+
 export interface NapiSnapshotBuilder extends NapiSnapshotBuilderSetters {
   create(): Promise<NapiSnapshot>;
   createArchive(out: string, plainTar?: boolean): Promise<NapiSnapshotArchive>;
@@ -657,10 +678,22 @@ export interface NapiSnapshotArchive {
   readonly path: string;
 }
 
+export interface NapiSnapshotCopyBuilderSetters {
+  labels(labels: Record<string, string>): this;
+  recordIntegrity(enabled: boolean): this;
+}
+
+export interface NapiSnapshotCopyBuilder
+  extends NapiSnapshotCopyBuilderSetters {
+  save(): Promise<void>;
+}
+
 export interface NapiSnapshot {
   readonly id: string;
   readonly path: string;
   readonly headUpdate: NapiHeadUpdate | null | undefined;
+  readonly reference: string;
+  readonly referenceKind: "id" | "path";
   readonly digest: string;
   readonly sizeBytes: bigint | null | undefined;
   readonly imageRef: string;
@@ -680,10 +713,13 @@ export interface NapiSnapshot {
   readonly createdAt: string; // RFC 3339 UTC
   readonly labels: Record<string, string>;
   readonly sourceSandbox: string | null | undefined;
+  copyTo(outputArchivePath: string): NapiSnapshotCopyBuilder;
+  saveTo(out: string, opts?: NapiSaveOpts): Promise<void>;
   verify(): Promise<NapiSnapshotVerifyReport>;
 }
 
 export interface NapiSnapshotHandle {
+  readonly path: string;
   readonly id: string;
   readonly digest: string;
   readonly name: string | null | undefined;
@@ -702,12 +738,15 @@ export interface NapiSnapshotHandle {
   readonly migrationState: string;
   readonly migrationErrorCode: string | null | undefined;
   readonly createdAt: number;
-  readonly path: string;
+  readonly reference: string;
+  readonly referenceKind: "id" | "path";
   open(): Promise<NapiSnapshot>;
   remove(opts?: NapiSnapshotRemoveOptions): Promise<void>;
+  saveTo(out: string, opts?: NapiSaveOpts): Promise<void>;
 }
 
 export interface NapiSnapshotInfo {
+  readonly path?: string | null;
   readonly id: string;
   readonly digest: string;
   readonly name: string | null | undefined;
@@ -726,7 +765,8 @@ export interface NapiSnapshotInfo {
   readonly migrationState: string;
   readonly migrationErrorCode: string | null | undefined;
   readonly createdAt: number;
-  readonly path: string;
+  readonly reference: string;
+  readonly referenceKind: "id" | "path";
 }
 
 export interface NapiSaveOpts {

@@ -9,6 +9,7 @@ import {
   SandboxNotFoundError,
   SandboxReplacedError,
   SnapshotSourceRecoveryError,
+  SandboxStopTimedOutError,
 } from "../../dist/index.js";
 import { mapNapiError } from "../../dist/internal/error-mapping.js";
 
@@ -85,6 +86,18 @@ describe("mapNapiError", () => {
   it("passes through unrecognised tags", () => {
     const raw = new Error("[Unknown] something else");
     expect(mapNapiError(raw)).toBe(raw);
+  });
+
+  it("maps a stop deadline to SandboxStopTimedOutError", () => {
+    const raw = new Error(
+      "[SandboxStopTimedOut] timed out waiting for sandbox to stop",
+    );
+    const mapped = mapNapiError(raw);
+
+    expect(mapped).toBeInstanceOf(SandboxStopTimedOutError);
+    expect((mapped as SandboxStopTimedOutError).code).toBe(
+      "sandboxStopTimedOut",
+    );
   });
 
   it("passes through plain Error messages", () => {

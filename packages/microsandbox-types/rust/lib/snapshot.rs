@@ -141,3 +141,22 @@ mod tests {
         assert!(serde_json::from_str::<DiskCompactionResult>(r#"{"dry_run":false,"input_layers":1,"selected_layers":0,"output_layers":1,"materialized_bytes":0,"total_us":0,"pause_us":0}"#).is_err());
     }
 }
+
+/// Released cloud descriptor wire contract.
+pub mod cloud_manifest;
+/// Pure disk generation descriptors.
+pub mod disk;
+/// Existing legacy descriptor identity and cloud projection rules.
+pub mod legacy;
+/// Canonical portable snapshot descriptor.
+pub mod manifest;
+/// Pure owned-storage snapshot inventory.
+pub mod owned;
+mod restore_defaults;
+
+pub use manifest::*;
+pub use owned::{
+    OWNED_VOLUMES_EXTENSION, OwnedDirectoryPayload, OwnedMountSnapshot, OwnedVolumeCapture,
+    OwnedVolumeData, validate_owned_volumes,
+};
+pub use restore_defaults::{RESTORE_DEFAULTS_EXTENSION, RestoreDefaults};

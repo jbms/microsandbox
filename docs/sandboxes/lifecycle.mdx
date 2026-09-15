@@ -95,6 +95,10 @@ Pausing an already-paused VM and resuming an already-running VM are no-ops. Full
 
 Stopping gracefully terminates guest processes and shuts down the VM. The sandbox moves to `Stopped`, but its configuration and filesystem remain available for the next start.
 
+`stop()` has no built-in deadline and never escalates to force-kill. Use the explicit timeout option in your SDK to bound graceful completion. Expiry returns a stop-timeout error without killing; an already accepted shutdown request may still complete afterward. On local sandboxes, successful completion also waits for the targeted runtime to release ownership. Cloud shutdown may include creating a durable disk checkpoint.
+
+Use `request_stop` and `wait_until_stopped` separately when you want to submit the stop and manage observation yourself. Call `kill` explicitly when forced termination is intended; force termination is local-only.
+
 <CodeGroup>
 ```typescript TypeScript
 await sb.stop();

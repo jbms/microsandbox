@@ -6,6 +6,8 @@
 mod error;
 #[cfg(test)]
 mod test_support;
+#[cfg(any(feature = "local", feature = "cloud"))]
+mod timing;
 
 //--------------------------------------------------------------------------------------------------
 // Exports
@@ -27,7 +29,6 @@ pub mod runtime;
 pub mod sandbox;
 #[cfg(feature = "local")]
 pub mod setup;
-#[cfg(feature = "local")]
 pub mod snapshot;
 pub mod volume;
 
@@ -97,11 +98,11 @@ pub use sandbox::{
     SandboxResourcesPatch, SandboxRuntimeOptionsPatch, SandboxTouchResult, VsockSpecPatch,
     validate_sandbox_name,
 };
-#[cfg(feature = "local")]
 pub use snapshot::{
     CheckpointSnapshotState, FileSnapshotState, HeadUpdate, HeadUpdateReason, LoadOpts, SaveOpts,
-    Snapshot, SnapshotArchive, SnapshotBuilder, SnapshotConfig, SnapshotDescriptor, SnapshotFormat,
-    SnapshotHandle, SnapshotRootDisk, SnapshotScope, SnapshotSpec, SnapshotState,
-    SnapshotVerifyReport, UpperIntegrity, UpperVerifyStatus,
+    Snapshot, SnapshotArchive, SnapshotBuilder, SnapshotConfig, SnapshotCopyBuilder,
+    SnapshotDescriptor, SnapshotFormat, SnapshotHandle, SnapshotReference, SnapshotRootDisk,
+    SnapshotScope, SnapshotSpec, SnapshotState, SnapshotVerifyReport, UpperIntegrity,
+    UpperVerifyStatus,
 };
 pub use volume::{Volume, VolumeConfig, VolumeHandle, VolumeKind, VolumeSpec};

@@ -1,7 +1,13 @@
 //! Dedicated snapshot restoration with explicit destination resource choices.
 
-use super::{ExternalMountRestorePolicy, MountBuilder, Sandbox, SandboxBuilder};
-use crate::MicrosandboxResult;
+#[cfg(feature = "net")]
+use microsandbox_network::policy::NetworkPolicy;
+
+use super::config::SnapshotRestoreMode;
+use super::{ExternalMountRestorePolicy, MountBuilder, Sandbox, SandboxBuilder, SecurityProfile};
+use crate::size::Mebibytes;
+use crate::snapshot::SnapshotReference;
+use crate::{MicrosandboxError, MicrosandboxResult, Operation, UnsupportedReason};
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -11,7 +17,7 @@ use crate::MicrosandboxResult;
 ///
 /// ```compile_fail
 /// use microsandbox::Sandbox;
-/// Sandbox::restore("saved").name("child").memory(128);
+/// Sandbox::restore("saved").name("child").image("alpine");
 /// ```
 ///
 /// ```compile_fail
@@ -22,20 +28,57 @@ pub struct RestoreBuilder {
     pub(crate) inner: SandboxBuilder,
 }
 
+/// Explicit boot-policy requests must survive deferred source resolution, even when their
+/// values equal defaults. Captured execution cannot acquire a different guest security setup.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RestoreBootOverrides {
+    pub(crate) security: bool,
+}
+
 //--------------------------------------------------------------------------------------------------
 // Methods
 //--------------------------------------------------------------------------------------------------
 
+impl RestoreBootOverrides {
+    /// Reject unsupported changes while the source is still metadata, before child publication.
+    pub(crate) fn validate_scope(
+        self,
+        scope: crate::snapshot::SnapshotScope,
+        mode: SnapshotRestoreMode,
+    ) -> MicrosandboxResult<()> {
+        if scope != crate::snapshot::SnapshotScope::Full || mode == SnapshotRestoreMode::DiskOnly {
+            return Ok(());
+        }
+        if self.security {
+            return Err(MicrosandboxError::unsupported(
+                Operation::SnapshotOps,
+                UnsupportedReason::NotAvailable(
+                    "security profile overrides require a disk snapshot or disk-only restore (disk_only() / --disk-only); full restore resumes the captured guest security profile".into(),
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Sandbox {
     /// Prepare to restore an installed snapshot or archive. No work starts until `restore()`.
     pub fn restore(snapshot: impl Into<String>) -> RestoreBuilder {
-        RestoreBuilder::new(snapshot)
+        Self::restore_ref(SnapshotReference::auto(snapshot))
+    }
+
+    /// Restore an explicit snapshot identifier or backend-scoped artifact path.
+    ///
+    /// References from `Snapshot::reference()` retain their identifier/path interpretation.
+    /// The selected backend resolves the reference; unsupported restore options fail before launch.
+    pub fn restore_ref(reference: impl Into<SnapshotReference>) -> RestoreBuilder {
+        RestoreBuilder::new(reference.into())
     }
 }
 
 impl RestoreBuilder {
-    fn new(snapshot: impl Into<String>) -> Self {
-        let mut inner = SandboxBuilder::new("").with_snapshot_source(snapshot);
+    fn new(reference: SnapshotReference) -> Self {
+        let mut inner = SandboxBuilder::new("").with_snapshot_reference(reference);
         // Global creation defaults must not silently authorize host access or override the
         // captured exec user. Destination bindings come only from this operation's builder.
         inner.config.spec.mounts.clear();
@@ -48,6 +91,62 @@ impl RestoreBuilder {
     /// Set the unique destination sandbox name.
     pub fn name(mut self, name: impl Into<String>) -> Self {
         self.inner.config.spec.name = name.into();
+        self
+    }
+
+    /// Set guest CPUs for disk boot. Full restore accepts only the captured CPU count.
+    pub fn cpus(mut self, count: u8) -> Self {
+        self.inner = self.inner.cpus(count);
+        self
+    }
+
+    /// Set guest memory for disk boot. Full restore accepts only the captured memory size.
+    pub fn memory(mut self, size: impl Into<Mebibytes>) -> Self {
+        self.inner = self.inner.memory(size);
+        self
+    }
+
+    /// Set the destination host's network policy before disk boot or captured execution resumes.
+    /// This changes traffic admission, not the captured guest interface or TLS trust setup.
+    #[cfg(feature = "net")]
+    pub fn network_policy(mut self, policy: NetworkPolicy) -> Self {
+        self.inner = self.inner.network(|network| network.policy(policy));
+        self
+    }
+
+    /// Set the destination host's concurrent TCP connection limit; zero explicitly means unlimited.
+    /// The limit is applied before disk boot or full-restore network activation.
+    #[cfg(feature = "net")]
+    pub fn max_connections(mut self, limit: usize) -> Self {
+        self.inner = self.inner.network(|network| network.max_connections(limit));
+        self
+    }
+
+    /// Disable the network device for disk boot. Full restore rejects removal of a captured device.
+    #[cfg(feature = "net")]
+    pub fn disable_network(mut self) -> Self {
+        self.inner = self.inner.disable_network();
+        self
+    }
+
+    /// Apply the guest security profile at disk boot, before any new workload can execute.
+    /// Captured processes cannot be retroactively confined, so full restore rejects this setter.
+    pub fn security(mut self, profile: SecurityProfile) -> Self {
+        self.inner = self.inner.security(profile);
+        self.inner.config.restore_boot_overrides.security = true;
+        self
+    }
+
+    /// Set the destination sandbox's maximum lifetime in seconds, including full restore.
+    /// This is runtime-owned enforcement, not a timeout on the restore call.
+    pub fn max_duration(mut self, secs: u64) -> Self {
+        self.inner = self.inner.max_duration(secs);
+        self
+    }
+
+    /// Auto-stop the destination sandbox after this many seconds of inactivity, including full restore.
+    pub fn idle_timeout(mut self, secs: u64) -> Self {
+        self.inner = self.inner.idle_timeout(secs);
         self
     }
 
@@ -96,8 +195,8 @@ impl RestoreBuilder {
 // Macros
 //--------------------------------------------------------------------------------------------------
 
-// Both operations deliberately expose the same resource vocabulary, without exposing image,
-// geometry, replacement, init or startup-command setters from the ordinary create builder.
+// Share resource bindings without exposing image, replacement, init or startup-command setters.
+// Destination boot controls belong only to RestoreBuilder, not the live branch builders.
 macro_rules! resource_methods {
     ($builder:ty) => {
         impl $builder {
@@ -212,6 +311,92 @@ resource_methods!(super::branch::BranchManyBuilder);
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_explicit_guest_security_changes_are_refused_for_full_execution() {
+        use crate::snapshot::SnapshotScope;
+
+        for security in [false, true] {
+            let overrides = RestoreBootOverrides { security };
+            assert!(
+                overrides
+                    .validate_scope(SnapshotScope::Disk, SnapshotRestoreMode::Full)
+                    .is_ok()
+            );
+            assert!(
+                overrides
+                    .validate_scope(SnapshotScope::Full, SnapshotRestoreMode::DiskOnly)
+                    .is_ok()
+            );
+            assert_eq!(
+                overrides
+                    .validate_scope(SnapshotScope::Full, SnapshotRestoreMode::Full)
+                    .is_err(),
+                security
+            );
+        }
+    }
+
+    #[test]
+    fn security_setter_keeps_explicit_intent_even_for_default_profile() {
+        for profile in [SecurityProfile::Default, SecurityProfile::Restricted] {
+            let restore = Sandbox::restore("saved").name("child").security(profile);
+            assert!(restore.inner.config.restore_boot_overrides.security);
+            assert_eq!(restore.inner.config.spec.security_profile, profile);
+        }
+    }
+
+    #[test]
+    fn destination_geometry_and_lifecycle_are_not_lost() {
+        let restore = Sandbox::restore("saved")
+            .name("child")
+            .cpus(2)
+            .memory(2048)
+            .max_duration(600)
+            .idle_timeout(120);
+        assert_eq!(restore.inner.config.spec.resources.cpus, 2);
+        assert_eq!(restore.inner.config.spec.resources.memory_mib, 2048);
+        assert_eq!(
+            restore.inner.config.spec.lifecycle.max_duration_secs,
+            Some(600)
+        );
+        assert_eq!(
+            restore.inner.config.spec.lifecycle.idle_timeout_secs,
+            Some(120)
+        );
+        assert!(!restore.inner.config.restore_boot_overrides.security);
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn destination_network_controls_apply_without_changing_guest_identity() {
+        let restore = Sandbox::restore("saved")
+            .name("child")
+            .network_policy(NetworkPolicy::none())
+            .max_connections(8);
+        let network = restore.inner.config.local_network_config().unwrap();
+        assert!(network.enabled);
+        assert_eq!(
+            serde_json::to_value(network.policy).unwrap(),
+            serde_json::to_value(NetworkPolicy::none()).unwrap()
+        );
+        assert_eq!(network.max_connections, Some(8.into()));
+        assert!(network.interface.mac.is_none());
+        assert!(!restore.inner.config.restore_boot_overrides.security);
+        let unlimited = Sandbox::restore("saved").name("child").max_connections(0);
+        assert_eq!(unlimited.inner.config.spec.network.max_connections, Some(0));
+        assert_eq!(
+            unlimited
+                .inner
+                .config
+                .local_network_config()
+                .unwrap()
+                .max_connections,
+            Some(microsandbox_network::config::ConnectionLimit::Unlimited)
+        );
+        let disabled = Sandbox::restore("saved").name("child").disable_network();
+        assert!(!disabled.inner.config.spec.network.enabled);
+    }
 
     #[test]
     fn restore_starts_without_host_bindings() {

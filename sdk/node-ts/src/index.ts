@@ -126,6 +126,7 @@ export type {
   SaveOpts,
   LoadOpts,
   HeadUpdate,
+  SnapshotCopyBuilder,
   SnapshotScope,
   SnapshotState,
   SnapshotVerifyReport,
@@ -253,6 +254,8 @@ function hideMethod(cls: { prototype: Record<string, unknown> }, name: string): 
 hideMethod(napi.NetworkBuilder, "buildJson");
 hideMethod(napi.NetworkBuilder, "policyJson");
 hideMethod(napi.NetworkBuilder, "policyFromBuilder");
+hideMethod(napi.RestoreBuilder, "networkPolicyJson");
+hideMethod(napi.RestoreBuilder, "networkPolicyFromBuilder");
 hideMethod(napi.SandboxBuilder, "execWithBuilder");
 hideMethod(napi.SandboxBuilder, "execStreamWithBuilder");
 hideMethod(napi.SandboxBuilder, "attachWithBuilder");
@@ -360,6 +363,18 @@ hideMethod(napi.SandboxBuilder, "attachWithBuilder");
       return this;
     };
   }
+  // Restore shares policy conversion, but never exposes the broad NetworkBuilder callback.
+  const restoreProto = napi.RestoreBuilder.prototype;
+  if (!restoreProto.networkPolicy) {
+    restoreProto.networkPolicy = function (p: unknown) {
+      if (p instanceof napi.NetworkPolicyBuilder) {
+        this.networkPolicyFromBuilder(p);
+      } else {
+        this.networkPolicyJson(JSON.stringify(remapKeys(p)));
+      }
+      return this;
+    };
+  }
 }
 
 export const DnsBuilder = napi.DnsBuilder;
@@ -456,6 +471,7 @@ export {
   SandboxAlreadyExistsError,
   SandboxNotFoundError,
   SandboxNotRunningError,
+  SandboxStopTimedOutError,
   SandboxReplacedError,
   SandboxStillRunningError,
   SnapshotSourceRecoveryError,

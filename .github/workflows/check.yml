@@ -1,6 +1,9 @@
 name: Check
 
 on:
+  # Qualify an exact branch revision for internal commit-image publication,
+  # including stacked PRs whose base is not main. This workflow publishes nothing.
+  workflow_dispatch:
   push:
     branches: [main, "releases/**"]
   pull_request:
@@ -383,7 +386,7 @@ jobs:
           cache-bin: false
           cache-targets: true
 
-      - uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2
+      - uses: taiki-e/install-action@d438492cf8a250514fa2d34b30bc3c0dc37c65ff # v2
         with:
           tool: cargo-nextest@0.9.143
 
@@ -1524,7 +1527,7 @@ jobs:
       - name: Clean runner disk
         run: scripts/ci/clean-runner-disk.sh
 
-      - uses: taiki-e/install-action@1ed6d7be6168f6c9046541087ff549b6bc581fdf # v2
+      - uses: taiki-e/install-action@d438492cf8a250514fa2d34b30bc3c0dc37c65ff # v2
         with:
           tool: cargo-nextest@0.9.143
 

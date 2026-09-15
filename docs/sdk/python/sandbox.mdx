@@ -913,7 +913,7 @@ Stream captured log entries as a [`LogStream`](#logstream). With `follow=True` t
 
 #### <span className="msb-recv">sb.</span><span className="msb-hn">stop()</span>
 
-<Tooltip tip="Graceful stop works on microsandbox cloud; timeout expiry cannot escalate to force kill."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
+<Tooltip tip="On Cloud, the timeout only limits how long the SDK waits; the accepted stop may continue server-side."><span className="msb-badge-limited">Different on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
 
 ```python
 async def stop(self, timeout: float | None = None) -> None
@@ -1499,7 +1499,7 @@ Start in attached or detached mode
 
 #### <span className="msb-recv">handle.</span><span className="msb-hn">stop()</span>
 
-<Tooltip tip="Graceful stop works on microsandbox cloud; timeout expiry cannot escalate to force kill."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
+<Tooltip tip="On Cloud, the timeout only limits how long the SDK waits; the accepted stop may continue server-side."><span className="msb-badge-limited">Different on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
 
 ```python
 stop(timeout=None)
@@ -1631,7 +1631,7 @@ Stream captured log entries (works without starting)
 
 #### <span className="msb-recv">handle.</span><span className="msb-hn">snapshot()</span>
 
-<Tooltip tip="Snapshots use local disk artifacts and are not available on microsandbox cloud."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+<Tooltip tip="Cloud disk snapshots require a stopped or crashed source. Local snapshots also support running or paused sources."><span className="msb-badge-limited">Limited on cloud <Icon icon="circle-info" size={11} /></span></Tooltip>
 
 ```python
 snapshot(name)

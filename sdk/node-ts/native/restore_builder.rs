@@ -1,11 +1,14 @@
+use microsandbox::sandbox::{LogLevel as RustLogLevel, RestoreBuilder, SecurityProfile};
+use microsandbox::size::Mebibytes;
+use napi::bindgen_prelude::*;
+use napi_derive::napi;
+
 use crate::error::to_napi_error;
 use crate::mount_builder::JsMountBuilder;
+use crate::network_policy_builder::JsNetworkPolicyBuilder;
 use crate::pull_progress::JsPullProgressStream;
 use crate::sandbox::Sandbox;
 use crate::sandbox_builder::{JsPullProgressCreate, parse_bind_addr};
-use microsandbox::sandbox::{LogLevel as RustLogLevel, RestoreBuilder};
-use napi::bindgen_prelude::*;
-use napi_derive::napi;
 
 //--------------------------------------------------------------------------------------------------
 // Types
@@ -25,10 +28,21 @@ pub struct JsRestoreBuilder {
 impl JsRestoreBuilder {
     /// Select an installed snapshot or archive; this does not start a VM.
     #[napi(constructor)]
-    pub fn new(snapshot: String) -> Self {
-        Self {
-            inner: Some(microsandbox::Sandbox::restore(snapshot)),
-        }
+    pub fn new(snapshot: String, reference_kind: Option<String>) -> Result<Self> {
+        // A remote path must stay a path even when it resembles a managed identifier.
+        let reference = match reference_kind.as_deref() {
+            None | Some("auto") => microsandbox::SnapshotReference::auto(snapshot),
+            Some("id") => microsandbox::SnapshotReference::id(snapshot),
+            Some("path") => microsandbox::SnapshotReference::path(snapshot),
+            Some(kind) => {
+                return Err(napi::Error::from_reason(format!(
+                    "unknown snapshot reference kind: {kind}"
+                )));
+            }
+        };
+        Ok(Self {
+            inner: Some(microsandbox::Sandbox::restore_ref(reference)),
+        })
     }
 
     /// Choose the destination sandbox name.
@@ -36,6 +50,101 @@ impl JsRestoreBuilder {
     pub fn name(&mut self, name: String) -> Result<&Self> {
         let inner = self.take_inner()?;
         self.inner = Some(inner.name(name));
+        Ok(self)
+    }
+
+    /// Set destination CPUs; full execution restore requires the captured count.
+    #[napi]
+    pub fn cpus(&mut self, count: u32) -> Result<&Self> {
+        let count =
+            u8::try_from(count).map_err(|_| napi::Error::from_reason("cpus out of u8 range"))?;
+        self.inner = Some(self.take_inner()?.cpus(count));
+        Ok(self)
+    }
+
+    /// Set destination memory in MiB; full execution restore requires captured geometry.
+    #[napi]
+    pub fn memory(&mut self, mib: u32) -> Result<&Self> {
+        self.inner = Some(self.take_inner()?.memory(Mebibytes::from(mib)));
+        Ok(self)
+    }
+
+    /// Set only host-side network policy, without DNS, TLS, or guest bootstrap changes.
+    #[napi(js_name = "networkPolicyJson")]
+    pub fn network_policy_json(&mut self, json: String) -> Result<&Self> {
+        let value: serde_json::Value = serde_json::from_str(&json)
+            .map_err(|e| napi::Error::from_reason(format!("invalid policy JSON: {e}")))?;
+        let fields = value
+            .as_object()
+            .ok_or_else(|| napi::Error::from_reason("restore network policy must be an object"))?;
+        if fields
+            .keys()
+            .any(|key| !matches!(key.as_str(), "default_egress" | "default_ingress" | "rules"))
+        {
+            return Err(napi::Error::from_reason(
+                "restore network policy accepts only default actions and rules",
+            ));
+        }
+        let policy = serde_json::from_value(value)
+            .map_err(|e| napi::Error::from_reason(format!("invalid policy JSON: {e}")))?;
+        self.inner = Some(self.take_inner()?.network_policy(policy));
+        Ok(self)
+    }
+
+    /// Set host-side policy from the existing policy builder.
+    #[napi(js_name = "networkPolicyFromBuilder")]
+    pub fn network_policy_from_builder(
+        &mut self,
+        builder: &JsNetworkPolicyBuilder,
+    ) -> Result<&Self> {
+        let policy = builder.build_rust_policy()?;
+        self.inner = Some(self.take_inner()?.network_policy(policy));
+        Ok(self)
+    }
+
+    /// Cap destination host-side concurrent network connections.
+    #[napi(js_name = "maxConnections")]
+    pub fn max_connections(&mut self, count: u32) -> Result<&Self> {
+        self.inner = Some(self.take_inner()?.max_connections(count as usize));
+        Ok(self)
+    }
+
+    /// Disable networking; full restore rejects removal of a captured NIC.
+    #[napi(js_name = "disableNetwork")]
+    pub fn disable_network(&mut self) -> Result<&Self> {
+        self.inner = Some(self.take_inner()?.disable_network());
+        Ok(self)
+    }
+
+    /// Set guest security for disk boot; explicit changes are rejected by full restore.
+    #[napi(ts_args_type = "profile: 'default' | 'restricted'")]
+    pub fn security(&mut self, profile: String) -> Result<&Self> {
+        let profile = match profile.as_str() {
+            "default" => SecurityProfile::Default,
+            "restricted" => SecurityProfile::Restricted,
+            _ => {
+                return Err(napi::Error::from_reason(
+                    "invalid security profile (expected default | restricted)",
+                ));
+            }
+        };
+        self.inner = Some(self.take_inner()?.security(profile));
+        Ok(self)
+    }
+
+    /// Apply the destination host's maximum runtime in seconds; zero expires immediately.
+    #[napi(js_name = "maxDuration")]
+    pub fn max_duration(&mut self, secs: f64) -> Result<&Self> {
+        let seconds = duration_seconds(secs)?;
+        self.inner = Some(self.take_inner()?.max_duration(seconds));
+        Ok(self)
+    }
+
+    /// Apply the destination host's idle timeout in seconds; zero expires immediately.
+    #[napi(js_name = "idleTimeout")]
+    pub fn idle_timeout(&mut self, secs: f64) -> Result<&Self> {
+        let seconds = duration_seconds(secs)?;
+        self.inner = Some(self.take_inner()?.idle_timeout(seconds));
         Ok(self)
     }
 
@@ -246,5 +355,38 @@ impl JsRestoreBuilder {
         self.inner
             .take()
             .ok_or_else(|| napi::Error::from_reason("RestoreBuilder already consumed"))
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Functions
+//--------------------------------------------------------------------------------------------------
+
+/// Retain explicit zero, but never truncate a positive limit into immediate expiry.
+fn duration_seconds(seconds: f64) -> Result<u64> {
+    if !seconds.is_finite() || seconds < 0.0 || seconds >= u64::MAX as f64 {
+        return Err(napi::Error::from_reason(
+            "restore duration must be finite, non-negative, and fit in seconds",
+        ));
+    }
+    Ok(seconds.ceil() as u64)
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::duration_seconds;
+
+    #[test]
+    fn restore_duration_preserves_zero_and_rounds_positive_limits_up() {
+        assert_eq!(duration_seconds(0.0).unwrap(), 0);
+        assert_eq!(duration_seconds(0.5).unwrap(), 1);
+        assert_eq!(duration_seconds(1.5).unwrap(), 2);
+        for value in [-1.0, f64::NAN, f64::INFINITY, u64::MAX as f64] {
+            assert!(duration_seconds(value).is_err());
+        }
     }
 }

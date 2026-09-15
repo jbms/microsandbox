@@ -410,8 +410,9 @@ mod tests {
 
     #[test]
     fn snapshot_stack_follows_released_v0_6_18_prefix() {
-        // Freeze the release branch's execution order, not timestamp order.
-        // New stack migrations may append but cannot interleave this prefix.
+        // This is also main's complete prefix at the v0.7.0 integration point.
+        // Keep execution order, not timestamp order: every main migration must
+        // precede the unreleased snapshot migrations when the branches converge.
         let released = [
             "m20260305_000001_create_image_tables",
             "m20260305_000002_create_sandbox_tables",
@@ -441,7 +442,10 @@ mod tests {
         ];
         let current: Vec<_> = migration_ids().collect();
         assert!(current.starts_with(&released));
-        assert_eq!(current[released.len()], SNAPSHOT_IDENTITY_MIGRATION_ID);
+        assert_eq!(
+            &current[released.len()..],
+            &[SNAPSHOT_IDENTITY_MIGRATION_ID, SNAPSHOT_GROUPS_MIGRATION_ID],
+        );
         assert!(canonical_applied_prefix(released).is_some());
     }
 

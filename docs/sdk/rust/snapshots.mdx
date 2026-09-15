@@ -4,9 +4,11 @@ description: Rust SDK - Snapshot API reference
 keywords: ["Rust SDK", "Rust snapshots", "microsandbox snapshots"]
 ---
 
-<Tooltip tip="Snapshot creation, restore, import, and export use local disk artifacts and are not available on microsandbox cloud."><span className="msb-badge-local">Local-only <Icon icon="circle-info" size={11} /></span></Tooltip>
+Create local disk snapshots of running, paused, stopped, or crashed sandboxes, or full checkpoints of running and paused sandboxes. Cloud disk snapshots use managed storage or the organization's host volume. See [Snapshots](/sandboxes/snapshots) for usage and lifecycle concepts.
 
-Create disk snapshots of running, paused, stopped, or crashed sandboxes, or full checkpoints of running and paused sandboxes. See [Snapshots](/sandboxes/snapshots) for usage and lifecycle concepts.
+<Note>
+Cloud supports disk snapshot create, get, list, open, remove, and dedicated restore for stopped or crashed sources. Live capture, full checkpoints, branching, groups, archive import/export/copy, verification, and disk maintenance remain local-only. Unsupported options return an explicit error before mutation. Pass snapshot objects or typed references instead of assuming that cloud storage is a path on the client host.
+</Note>
 
 ## Snapshot groups
 
@@ -63,7 +65,8 @@ Per-disk `total_us` measures preparation/materialization only; aggregate `total_
 
 `last_layers: Some(n)` is an alternative to `since`; they cannot be combined with each other or `with_parents`. For direct restore, use `Sandbox::restore("changes.msb").name("child").snapshot_base("worker:checkpoint-a")`. See [disk-chain maintenance](/sandboxes/snapshots#export-changes-and-compact-a-disk-chain) for dependency and retention rules.
 
-## Snapshot
+
+## Static methods
 
 #### <span className="msb-recv">Snapshot::</span><span className="msb-hn">builder()</span>
 
@@ -200,6 +203,21 @@ Open an existing artifact by group head, `group:member`, or path. This is a fast
   </div>
 </div>
 
+#### <span className="msb-recv">Snapshot::</span><span className="msb-hn">open_ref()</span>
+
+```rust
+async fn open_ref(reference: impl Into<SnapshotReference>) -> MicrosandboxResult<Snapshot>
+```
+
+Open a snapshot from an explicit [`SnapshotReference`](#snapshotreference).
+Use this when passing through a reference returned by another SDK operation;
+it preserves whether the backend should resolve the value as an identifier or
+a path.
+
+```rust
+let snap = Snapshot::open_ref(SnapshotReference::Id(snapshot_id)).await?;
+```
+
 #### <span className="msb-recv">Snapshot::</span><span className="msb-hn">get()</span>
 
 ```rust
@@ -251,7 +269,9 @@ for h in Snapshot::list().await? {
 
 </Accordion>
 
-List indexed snapshots from the local DB cache, newest first. External-path artifacts booted by full path aren't in the index and won't appear here; use [`list_dir`](#snapshotlist_dir) to enumerate artifacts on disk directly.
+List snapshots from the active backend. Locally this uses the local index;
+in cloud it paginates through managed snapshots. Host-volume artifacts are not
+included automatically.
 
 <p className="msb-label">Returns</p>
 
@@ -317,20 +337,24 @@ Remove a snapshot artifact by group selector, unambiguous ID or digest, or path,
   </div>
 </div>
 
+#### <span className="msb-recv">Snapshot::</span><span className="msb-hn">remove_ref()</span>
+
+```rust
+async fn remove_ref(
+    reference: impl Into<SnapshotReference>,
+    force: bool,
+) -> MicrosandboxResult<()>
+```
+
+Remove a snapshot using an explicit backend-neutral reference. Prefer this
+over [`remove()`](#snapshotremove) when the value came from
+`Snapshot::reference()` or `SnapshotHandle::reference()`.
+
 #### <span className="msb-recv">Snapshot::</span><span className="msb-hn">reindex()</span>
 
 ```rust
 async fn reindex(dir: impl AsRef<Path>) -> MicrosandboxResult<usize>
 ```
-
-<Accordion title="Example">
-
-```rust
-let n = Snapshot::reindex("/data/snapshots").await?;
-println!("indexed {n} snapshots");
-```
-
-</Accordion>
 
 Rebuild the local index from the artifacts in `dir`. Upserts an index row for every artifact found, then recomputes parent-edge child counts in one pass so the cache stays honest about the current set of artifacts.
 
@@ -360,6 +384,17 @@ println!("indexed {n} snapshots");
 ```
 
 </Accordion>
+
+#### <span className="msb-recv">Snapshot::</span><span className="msb-hn">reindex_default()</span>
+
+```rust
+async fn reindex_default() -> MicrosandboxResult<usize>
+```
+
+Rebuild the local snapshot index from the configured default snapshot
+directory. This is equivalent to [`reindex()`](#snapshotreindex) with the
+local backend's configured store and returns `MicrosandboxError::Unsupported`
+on backends without a rebuildable artifact index.
 
 ---
 
@@ -490,20 +525,20 @@ SHA-256 digest of the canonical descriptor bytes. This detects descriptor confli
   </div>
 </div>
 
-#### <span className="msb-recv">snap.</span><span className="msb-hn">path()</span>
+#### <span className="msb-recv">snap.</span><span className="msb-hn">reference()</span>
 
 ```rust
-fn path(&self) -> &Path
+fn reference(&self) -> SnapshotReference
 ```
 
-Path to the artifact directory holding `snapshot.json`, optional `metadata.json`, and the captured physical layer closure.
+Backend-neutral locator that preserves whether the snapshot is addressed by an identifier or path. Use it with dedicated restore and lifecycle methods without assuming client-host filesystem access.
 
 <p className="msb-label">Returns</p>
 
 <div className="msb-params">
   <div className="msb-param">
-    <div className="msb-param-key"><span className="msb-type">&amp;Path</span></div>
-    <div className="msb-param-desc">Artifact directory path.</div>
+    <div className="msb-param-key"><span className="msb-type">SnapshotReference</span></div>
+    <div className="msb-param-desc">Typed backend-relative snapshot reference.</div>
   </div>
 </div>
 
@@ -537,10 +572,12 @@ The parsed [`Manifest`](#manifest): stable identity, state closure, capture prov
 #### <span className="msb-recv">snap.</span><span className="msb-hn">size_bytes()</span>
 
 ```rust
-fn size_bytes(&self) -> u64
+fn size_bytes(&self) -> Option<u64>
 ```
 
-Apparent size of the captured upper layer in bytes (the ext4 virtual size; sparse on disk).
+Backend-reported stored payload size. This is the apparent upper-file size for
+local and host-volume artifacts, and the stored archive size for managed cloud
+snapshots.
 
 <p className="msb-label">Returns</p>
 
@@ -550,6 +587,50 @@ Apparent size of the captured upper layer in bytes (the ext4 virtual size; spars
     <div className="msb-param-desc">Upper-layer apparent size in bytes.</div>
   </div>
 </div>
+
+#### <span className="msb-recv">snap.</span><span className="msb-hn">path()</span>
+
+```rust
+fn path(&self) -> MicrosandboxResult<&Path>
+```
+
+Return the local artifact directory. Cloud snapshots return
+`MicrosandboxError::Unsupported` because managed and host-volume artifacts are
+not paths on the client host. Use `reference()` for backend-neutral restore and
+lifecycle operations.
+
+#### <span className="msb-recv">snap.</span><span className="msb-hn">save_to()</span>
+
+```rust
+async fn save_to(&self, out: &Path, opts: SaveOpts) -> MicrosandboxResult<()>
+```
+
+Bundle this snapshot into an archive using the backend retained when it was
+created or opened. This avoids re-resolving its reference through the current
+default backend. Artifact archives are currently local-only; other backends
+return `MicrosandboxError::Unsupported`.
+
+#### <span className="msb-recv">snap.</span><span className="msb-hn">copy_to()</span>
+
+```rust
+fn copy_to(&self, output_archive_path: impl Into<PathBuf>) -> SnapshotCopyBuilder
+```
+
+Create a new archive from this snapshot's disk data while replacing its labels
+and integrity metadata. The source snapshot is unchanged. Artifact copies are
+currently local-only; other backends return `MicrosandboxError::Unsupported`
+when `save()` is awaited.
+
+```rust
+use std::collections::BTreeMap;
+
+let copied_manifest = snapshot
+    .copy_to("./baseline-copy.tar.zst")
+    .labels(BTreeMap::from([("environment".into(), "test".into())]))
+    .record_integrity(true)
+    .save()
+    .await?;
+```
 
 #### <span className="msb-recv">snap.</span><span className="msb-hn">verify()</span>
 
@@ -582,13 +663,11 @@ Verify the snapshot's complete state closure. File state recomputes recorded upp
   </div>
 </div>
 
-## SnapshotHandle
+## SnapshotHandle methods
 
-<div className="msb-tags"><span className="msb-tag is-type">struct</span></div>
-
-<p className="msb-backref">Returned by <a href="#snapshotget">Snapshot::get()</a> · <a href="#snapshotlist">Snapshot::list()</a> · <a href="#snapshotload">Snapshot::load()</a></p>
-
-A snapshot handle backed by the local index.
+Accessors and lifecycle on a [`SnapshotHandle`](#snapshothandle) returned by
+the active backend. Returned by [`Snapshot::get()`](#snapshotget),
+[`Snapshot::list()`](#snapshotlist), and [`Snapshot::load()`](#snapshotload).
 
 #### <span className="msb-recv">h.</span><span className="msb-hn">digest()</span>
 
@@ -658,7 +737,17 @@ On-disk format of the upper layer.
 fn size_bytes(&self) -> Option<u64>
 ```
 
-Apparent size of the upper file at index time, if recorded.
+Backend-reported stored payload size, if known.
+
+#### <span className="msb-recv">h.</span><span className="msb-hn">path()</span>
+
+```rust
+fn path(&self) -> MicrosandboxResult<&Path>
+```
+
+Return the local artifact directory. Cloud snapshots return
+`MicrosandboxError::Unsupported`. Use `reference()` for backend-neutral restore
+and lifecycle operations.
 
 #### <span className="msb-recv">h.</span><span className="msb-hn">created_at()</span>
 
@@ -667,14 +756,6 @@ fn created_at(&self) -> chrono::NaiveDateTime
 ```
 
 Snapshot creation time, parsed from the manifest.
-
-#### <span className="msb-recv">h.</span><span className="msb-hn">path()</span>
-
-```rust
-fn path(&self) -> &Path
-```
-
-Local artifact directory path.
 
 #### <span className="msb-recv">h.</span><span className="msb-hn">open()</span>
 
@@ -692,7 +773,8 @@ snap.verify().await?;
 
 </Accordion>
 
-Open the underlying artifact metadata, upgrading this lightweight handle to a full [`Snapshot`](#instance-methods). Equivalent to [`Snapshot::open(self.path())`](#snapshotopen).
+Open the underlying snapshot metadata using the backend retained by the handle,
+without requiring the caller to interpret its storage location.
 
 <p className="msb-label">Returns</p>
 
@@ -741,11 +823,37 @@ let child = Sandbox::restore("api:baseline")
     .await?;
 ```
 
-Use `.forked()` for private CoW RAM, `.disk_only()` to cold-boot only a full snapshot's disk, and `.snapshot_base(base)` for a dependent archive. `restore_with_progress()` returns the shared progress stream and result task. Image, CPU/RAM size, replacement, and startup-command setters are not accepted.
+Use `.forked()` for private CoW RAM, `.disk_only()` to cold-boot only a full snapshot's disk, and `.snapshot_base(base)` for a dependent archive. `restore_with_progress()` returns the shared progress stream and result task. Image, replacement, and startup-command setters are not accepted.
+
+Destination controls are applied before disk boot. Full restore can apply host-enforced traffic and lifetime controls but cannot replay guest security initialization. The following methods return `Self`; backend capability checks still apply on cloud.
+
+| Method | Disk boot | Full execution restore |
+| --- | --- | --- |
+| `cpus(u8)`, `memory(impl Into<Mebibytes>)` | Select destination CPU/RAM | Must equal the captured geometry |
+| `network_policy(NetworkPolicy)` | Replace the destination host traffic policy | Applied before network activation; guest identity stays captured |
+| `max_connections(usize)` | Set concurrent TCP cap; zero is unlimited | Same host-side admission control |
+| `disable_network()` | Remove the network device | Rejected when the checkpoint contains a network device |
+| `security(SecurityProfile)` | Apply guest confinement at boot | Explicit values are rejected, even `Default`; use `disk_only()` for a cold boot |
+| `max_duration(u64)`, `idle_timeout(u64)` | Lifetime/inactivity limits in seconds | Enforced by the destination host runtime |
+
+These controls do not add arbitrary network-builder access to guest TLS trust or secret placeholders. Omitted controls keep the configured defaults; explicit network-policy replacement is deliberate. Restore creates an idle detached sandbox for disk snapshots, so use `exec` or `shell` afterward to run a workload.
 
 Destination bindings use `.volume(guest, |v| ...)`, `.port(...)`, `.port_bind(...)`, `.port_udp(...)`, `.port_udp_bind(...)`, `.vsock(...)`, and `.vsock_dgram(...)`. Use `|v| v.captured()` for a captured private volume. `.user(...)` sets the default user for new execs; `.log_level(...)` configures host runtime logging. Host resources are not inherited unless `.dangerously_inherit_resources()` is explicitly selected. `.external_mount_policy(...)` validates supplied filesystem mappings; it does not grant access.
 
-## SandboxHandle
+#### <span className="msb-recv">Sandbox::</span><span className="msb-hn">restore_ref()</span>
+
+```rust
+fn restore_ref(reference: impl Into<SnapshotReference>) -> RestoreBuilder
+```
+
+Restore from an explicit backend-neutral snapshot reference. Pass a `Snapshot` or `SnapshotHandle` reference without reinterpreting an identifier as a path. This uses the same dedicated restore options and backend capability checks as `Sandbox::restore()`.
+
+```rust
+let restored = Sandbox::restore_ref(snapshot.reference())
+    .name("api-restored")
+    .restore()
+    .await?;
+```
 
 #### <span className="msb-recv">h.</span><span className="msb-hn">snapshot()</span>
 
@@ -790,11 +898,20 @@ let snap = Snapshot::builder("baseline")
 
 ## SnapshotBuilder
 
-Builder for snapshot configuration.
+Builder for a [`SnapshotConfig`](#snapshotconfig). Obtained via [`Snapshot::builder(name)`](#snapshotbuilder). A source sandbox is required ([`from_sandbox`](#from_sandbox)); the other setters are optional. Every setter returns `Self`, so calls chain.
+
+```rust
+let snap = Snapshot::builder("after-pip-install")
+    .from_sandbox("api")           // sandbox to capture
+    .label("stage", "post-deps")
+    .record_integrity()            // hash the upper layer
+    .create()
+    .await?;
+```
 
 ---
 
-#### <span className="msb-recv">snapshot_builder.</span><span className="msb-hn">from_sandbox()</span>
+#### <span className="msb-recv">.</span><span className="msb-hn">from_sandbox()</span>
 <div className="msb-tags"><span className="msb-tag is-builder">builder</span></div>
 
 ```rust
@@ -814,7 +931,7 @@ Set the sandbox to capture. Required; [`build()`](#snapshot_builder-build) and [
 
 ---
 
-#### <span className="msb-recv">snapshot_builder.</span><span className="msb-hn">dest_dir()</span>
+#### <span className="msb-recv">.</span><span className="msb-hn">dest_dir()</span>
 <div className="msb-tags"><span className="msb-tag is-builder">builder</span></div>
 
 ```rust
@@ -832,7 +949,7 @@ Create the snapshot group under this parent directory instead of the default sna
   </div>
 </div>
 
-#### <span className="msb-recv">snapshot_builder.</span><span className="msb-hn">label()</span>
+#### <span className="msb-recv">.</span><span className="msb-hn">label()</span>
 
 ```rust
 fn label(self, key: impl Into<String>, value: impl Into<String>) -> Self
@@ -853,7 +970,7 @@ Add a user label. Can be called multiple times. Labels are sorted by key in the 
   </div>
 </div>
 
-#### <span className="msb-recv">snapshot_builder.</span><span className="msb-hn">force()</span>
+#### <span className="msb-recv">.</span><span className="msb-hn">force()</span>
 
 ```rust
 fn force(self) -> Self
@@ -861,7 +978,7 @@ fn force(self) -> Self
 
 Overwrite an existing direct archive output file. Installed group members are immutable, so installed creation rejects this option.
 
-#### <span className="msb-recv">snapshot_builder.</span><span className="msb-hn">record_integrity()</span>
+#### <span className="msb-recv">.</span><span className="msb-hn">record_integrity()</span>
 
 ```rust
 fn record_integrity(self) -> Self
@@ -880,7 +997,7 @@ fn full(self) -> Self
 
 Capture disk, memory, execution, and device state from a running sandbox. The runtime briefly quiesces the VM and returns the source to running state after checkpoint publication.
 
-#### <span className="msb-recv">snapshot_builder.</span><span className="msb-hn">build()</span>
+#### <span className="msb-recv">.</span><span className="msb-hn">build()</span>
 
 ```rust
 fn build(self) -> MicrosandboxResult<SnapshotConfig>
@@ -897,7 +1014,7 @@ Materialize the [`SnapshotConfig`](#snapshotconfig) without creating the snapsho
   </div>
 </div>
 
-#### <span className="msb-recv">snapshot_builder.</span><span className="msb-hn">create()</span>
+#### <span className="msb-recv">.</span><span className="msb-hn">create()</span>
 
 ```rust
 async fn create(self) -> MicrosandboxResult<Snapshot>
@@ -914,7 +1031,63 @@ Build and execute the snapshot in one step. Equivalent to [`Snapshot::create(sel
   </div>
 </div>
 
+## SnapshotCopyBuilder
+
+Returned by [`Snapshot::copy_to()`](#snapcopy_to). It reuses the source disk
+data while replacing explicit-snapshot metadata in a new archive.
+
+| Method | Returns | Description |
+|--------|---------|-------------|
+| `labels(BTreeMap<String, String>)` | `Self` | Replace all labels in the copied manifest |
+| `record_integrity(bool)` | `Self` | Compute integrity when true, or omit it when false |
+| `save()` | `MicrosandboxResult<Manifest>` | Write the archive and return its manifest |
+
 ## Types
+
+### SnapshotReference
+
+<div className="msb-tags"><span className="msb-tag is-type">enum</span></div>
+
+A backend-neutral snapshot locator. Obtain one from `Snapshot::reference()` or
+`SnapshotHandle::reference()` and pass it to
+`Sandbox::restore_ref()`, `Snapshot::open_ref()`, or
+`Snapshot::remove_ref()`. This preserves whether a value is an identifier or a
+path without exposing the selected backend.
+
+| Variant | Meaning |
+|---------|---------|
+| `Auto(String)` | Compatibility string interpreted automatically by the active backend |
+| `Id(String)` | Identifier resolved by the selected backend |
+| `Path(String)` | Path in the selected backend's filesystem namespace |
+
+Use `SnapshotReference::auto()`, `id()`, or `path()` to construct a reference.
+`value()` returns the underlying string and `kind()` returns `auto`, `id`, or
+`path`.
+
+### SnapshotHandle
+
+<div className="msb-tags"><span className="msb-tag is-type">struct</span></div>
+
+<p className="msb-backref">Returned by <a href="#snapshotget">Snapshot::get()</a> · <a href="#snapshotlist">Snapshot::list()</a> · <a href="#snapshotload">Snapshot::load()</a></p>
+
+A lightweight handle returned by the active backend. Use [`open()`](#h-open) to
+read the snapshot metadata. The handle retains its backend, so `open()` and
+`remove()` work without the caller interpreting its storage location.
+
+| Method | Type | Description |
+|--------|------|-------------|
+| digest() | `&str` | Manifest digest (`sha256:hex`) |
+| name() | `Option<&str>` | Name alias; `None` for digest-only entries |
+| parent_digest() | `Option<&str>` | Parent snapshot digest, or `None` for a root |
+| scope() | [`SnapshotScope`](#snapshotscope) | Snapshot payload scope (`Disk` today) |
+| image_ref() | `&str` | Source image reference |
+| format() | [`SnapshotFormat`](#snapshotformat) | On-disk upper format |
+| size_bytes() | `Option<u64>` | Upper file size at index time |
+| created_at() | `chrono::NaiveDateTime` | Creation time from the manifest |
+| reference() | `SnapshotReference` | Stable backend-neutral restore reference |
+| open() | `Result<`[`Snapshot`](#instance-methods)`>` | Open the underlying artifact |
+| remove(force) | `Result<()>` | Remove this snapshot |
+| save_to(out, opts) | `Result<()>` | Bundle through the backend retained by this handle |
 
 ### SnapshotConfig
 
@@ -961,9 +1134,9 @@ Snapshot payload scope. Parsing accepts every known scope so older runtimes can 
 
 <div className="msb-tags"><span className="msb-tag is-type">struct</span></div>
 
-<p className="msb-backref">Used by <a href="#snapshotsave">Snapshot::save()</a></p>
+<p className="msb-backref">Used by <a href="#snapshotsave">Snapshot::save()</a> and instance <code>save_to()</code> methods</p>
 
-Options for [`Snapshot::save()`](#snapshotsave). Implements `Default`; `SaveOpts::default()` writes the head snapshot only, zstd-compressed.
+Options for [`Snapshot::save()`](#snapshotsave) and instance `save_to()` methods. Implements `Default`; `SaveOpts::default()` writes the head snapshot only, zstd-compressed.
 
 | Field | Type | Description |
 |-------|------|-------------|

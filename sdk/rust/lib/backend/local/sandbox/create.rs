@@ -24,7 +24,7 @@ use tokio::sync::Mutex;
 use super::LocalBackend;
 use crate::MicrosandboxResult;
 use crate::agent::AgentClient;
-use crate::backend::Backend;
+use crate::backend::{Backend, SnapshotBackend};
 use crate::db::entity::{
     run as run_entity, sandbox as sandbox_entity, sandbox_label as sandbox_label_entity,
     sandbox_rootfs as sandbox_rootfs_entity,
@@ -40,6 +40,7 @@ use crate::sandbox::{
     remove_dir_if_exists, validate_env, validate_hostname, validate_labels, validate_sandbox_name,
     validate_volume_mounts,
 };
+use crate::timing::{self, TARGET};
 use cleanup::CreationCleanup;
 
 //--------------------------------------------------------------------------------------------------
@@ -129,6 +130,7 @@ impl LocalBackend {
     /// impl and the pull-progress shims forward the Arc they were handed so
     /// the returned [`Sandbox`] routes follow-up calls through this same
     /// backend.
+    #[tracing::instrument(target = TARGET, level = "trace", name = "sandbox_local_create", skip_all, fields(sandbox_name = %config.spec.name))]
     pub(crate) async fn create_sandbox(
         &self,
         backend: Arc<dyn Backend>,
@@ -136,6 +138,13 @@ impl LocalBackend {
         mode: SpawnMode,
         progress: Option<PullProgressSender>,
     ) -> MicrosandboxResult<Sandbox> {
+        // Compatibility callers can supply a snapshot reference alongside an image.
+        // Resolve it with this backend before replacement or child reservation can mutate state.
+        if let Some(reference) = config.snapshot_reference.take() {
+            SnapshotBackend::prepare_restore(self, backend.clone(), &mut config, reference).await?;
+        }
+
+        let timing_name = config.spec.name.clone();
         tracing::debug!(
             sandbox = %config.spec.name,
             image = ?config.spec.image,
@@ -169,9 +178,12 @@ impl LocalBackend {
         // Transition ownership is deliberately separate from the runtime lifecycle lock: this
         // guard serializes database/storage mutation and launcher-to-runtime handoff, while the
         // lifecycle lock remains owned by the VM for its entire runtime generation.
-        let _transition_guard =
-            Self::acquire_sandbox_transition_guard(&self.config().run_dir(), &config.spec.name)
-                .await?;
+        let _transition_guard = timing::measure(
+            &timing_name,
+            "transition_lock",
+            Self::acquire_sandbox_transition_guard(&self.config().run_dir(), &config.spec.name),
+        )
+        .await?;
         Self::prepare_create_target(db, &config, &sandbox_dir, &self.config().run_dir()).await?;
         // Hold the existing lifecycle lock across reservation, capture and spawn. Recheck
         // under the lock so two creates cannot both own the same child staging directory.
@@ -219,6 +231,7 @@ impl LocalBackend {
                 disk_only,
                 config.snapshot_base.as_deref(),
                 &config.restore_resources,
+                config.restore_boot_overrides,
             ))
             .await?;
             config.spec.image = RootfsSource::oci(materialized.manifest.image.reference.clone());
@@ -379,16 +392,28 @@ impl LocalBackend {
                 pull_result,
                 metadata_reference,
                 cached_metadata,
-            } = self
-                .resolve_oci_image_for_create(
+            } = timing::measure(
+                &timing_name,
+                "image_resolution",
+                self.resolve_oci_image_for_create(
                     &reference,
                     config.spec.pull_policy,
                     overrides,
                     expected_snapshot_manifest_digest.as_deref(),
                     image_materialization,
                     progress,
-                )
-                .await?;
+                ),
+            )
+            .await?;
+
+            tracing::trace!(
+                target: timing::TARGET,
+                sandbox_name = %timing_name,
+                layers_cached = pull_result.cached,
+                layer_count = pull_result.layer_diff_ids.len(),
+                materialization = ?image_materialization,
+                "sandbox image resolved"
+            );
 
             // Snapshot overlays are meaningful only against the exact base
             // image digest captured in their descriptor.
@@ -489,8 +514,12 @@ impl LocalBackend {
             let flat_tree = if !config.spec.patches.is_empty()
                 && matches!(root_disk, RootDisk::Flat { .. })
             {
-                match build_flat_tree(&config.spec.patches, &layer_erofs_paths, &flat_patch_spool)
-                    .await
+                match timing::measure(
+                    &timing_name,
+                    "patch_tree",
+                    build_flat_tree(&config.spec.patches, &layer_erofs_paths, &flat_patch_spool),
+                )
+                .await
                 {
                     Ok(tree) => Some(tree),
                     Err(error) => {
@@ -503,7 +532,14 @@ impl LocalBackend {
             };
             let upper_tree =
                 if !config.spec.patches.is_empty() && !matches!(root_disk, RootDisk::Flat { .. }) {
-                    Some(build_upper_tree(&config.spec.patches, &layer_erofs_paths).await?)
+                    Some(
+                        timing::measure(
+                            &timing_name,
+                            "patch_tree",
+                            build_upper_tree(&config.spec.patches, &layer_erofs_paths),
+                        )
+                        .await?,
+                    )
                 } else {
                     None
                 };
@@ -535,11 +571,15 @@ impl LocalBackend {
                     *size_mib = Some(target_mib);
                 }
             } else if let Some((base, target_mib, clone)) = flat_spec {
-                crate::sandbox::flat_rootfs::create_private_flat_rootfs(
-                    base,
-                    sandbox_dir.join(crate::sandbox::flat_rootfs::FLAT_ROOTFS_FILENAME),
-                    target_mib,
-                    clone,
+                timing::measure(
+                    &timing_name,
+                    "flat_root_clone",
+                    crate::sandbox::flat_rootfs::create_private_flat_rootfs(
+                        base,
+                        sandbox_dir.join(crate::sandbox::flat_rootfs::FLAT_ROOTFS_FILENAME),
+                        target_mib,
+                        clone,
+                    ),
                 )
                 .await?;
                 if let RootfsSource::Oci(oci) = &mut config.spec.image
@@ -579,8 +619,12 @@ impl LocalBackend {
                         let upper_size_mib =
                             size_mib.unwrap_or(crate::sandbox::config::DEFAULT_OCI_UPPER_SIZE_MIB);
                         if !upper_path.exists() || upper_tree.is_some() {
-                            Self::create_upper_ext4(&upper_path, upper_size_mib, upper_tree)
-                                .await?;
+                            timing::measure(
+                                &timing_name,
+                                "writable_disk_create",
+                                Self::create_upper_ext4(&upper_path, upper_size_mib, upper_tree),
+                            )
+                            .await?;
                         }
                     }
                     // The builder rejects patches with tmpfs root disks and
@@ -643,7 +687,14 @@ impl LocalBackend {
         // Sandbox-time named-volume creation is one-shot create intent. Provision
         // before inserting the sandbox row so volume conflicts or incompatibilities
         // cannot leave a stopped sandbox that never booted.
-        let created_named_volumes = Arc::new(ensure_named_volumes(self, &config).await?);
+        let created_named_volumes = Arc::new(
+            timing::measure(
+                &timing_name,
+                "named_volumes",
+                ensure_named_volumes(self, &config),
+            )
+            .await?,
+        );
         let has_owned_volumes = config
             .spec
             .mounts
@@ -676,20 +727,25 @@ impl LocalBackend {
         let mut persisted_config = config.clone_for_persistence();
         // Keep restore intent until activation succeeds so an interrupted restore cannot boot cold.
         persisted_config.checkpoint_restore = config.checkpoint_restore.clone();
-        let sandbox_id =
-            match Self::insert_starting_sandbox_record(write_db, &persisted_config).await {
-                Ok(sandbox_id) => sandbox_id,
-                Err(err) => {
-                    rollback_created_named_volumes(self, &created_named_volumes).await;
-                    if has_owned_volumes {
-                        // A failed commit may have an uncertain catalog outcome. Staging
-                        // already belongs to cleanup's writer-side ownership recheck.
-                        drop(lifecycle_guard);
-                        return Err(creation_cleanup.finish_owned_failure(err).await);
-                    }
-                    return Err(err);
+        let sandbox_id = match timing::measure(
+            &timing_name,
+            "persist_start",
+            Self::insert_starting_sandbox_record(write_db, &persisted_config),
+        )
+        .await
+        {
+            Ok(sandbox_id) => sandbox_id,
+            Err(err) => {
+                rollback_created_named_volumes(self, &created_named_volumes).await;
+                if has_owned_volumes {
+                    // A failed commit may have an uncertain catalog outcome. Staging
+                    // already belongs to cleanup's writer-side ownership recheck.
+                    drop(lifecycle_guard);
+                    return Err(creation_cleanup.finish_owned_failure(err).await);
                 }
-            };
+                return Err(err);
+            }
+        };
         if let Some(guard) = child_stage_guard.as_mut() {
             // The database row now owns the fully materialized child storage;
             // later failures intentionally follow ordinary sandbox cleanup.
@@ -799,9 +855,11 @@ impl LocalBackend {
                     })?;
                     return Err(creation_cleanup.finish_owned_failure(error).await);
                 }
-                Err(_) => {
+                Err(cause) => {
+                    // A fast-exiting startup command can close the transport during stat.
+                    // Preserve that cause instead of claiming the directory is missing.
                     let error = crate::MicrosandboxError::InvalidConfig(format!(
-                        "workdir does not exist in guest: {workdir}"
+                        "could not validate workdir in guest {workdir:?}: {cause}"
                     ));
                     sandbox.terminate_creation_owner().await;
                     self.rollback_failed_startup(
@@ -947,8 +1005,12 @@ impl LocalBackend {
         mode: SpawnMode,
         lifecycle_guard: Option<microsandbox_runtime::ipc::SandboxLifecycleGuard>,
     ) -> MicrosandboxResult<(crate::backend::SandboxLocalState, SandboxConfig)> {
-        let (handle, agent_sock_path) =
-            spawn_sandbox(self, &config, sandbox_id, mode, lifecycle_guard).await?;
+        let (handle, agent_sock_path) = timing::measure(
+            &config.spec.name,
+            "process_launch",
+            spawn_sandbox(self, &config, sandbox_id, mode, lifecycle_guard),
+        )
+        .await?;
         let mut startup_process = StartupProcess::new(handle);
         let log_dir = self.sandboxes_dir().join(&config.spec.name).join("logs");
         if let Err(error) = startup_process
@@ -976,12 +1038,16 @@ impl LocalBackend {
         let startup_deadline = tokio::time::Instant::now() + AGENT_RELAY_READY_TIMEOUT;
 
         // Wait for the relay socket to become available.
-        let client = match Self::wait_for_relay(
-            &agent_sock_path,
-            &log_dir,
-            startup_process.handle_mut(),
+        let client = match timing::measure(
             &config.spec.name,
-            startup_deadline.saturating_duration_since(tokio::time::Instant::now()),
+            "agent_ready",
+            Self::wait_for_relay(
+                &agent_sock_path,
+                &log_dir,
+                startup_process.handle_mut(),
+                &config.spec.name,
+                startup_deadline.saturating_duration_since(tokio::time::Instant::now()),
+            ),
         )
         .await
         {
@@ -1002,6 +1068,7 @@ impl LocalBackend {
 
         if let Ok(ready) = client.ready() {
             tracing::info!(
+                sandbox_name = %config.spec.name,
                 boot_time_ms = ready.boot_time_ns / 1_000_000,
                 init_time_ms = ready.init_time_ns / 1_000_000,
                 ready_time_ms = ready.ready_time_ns / 1_000_000,
@@ -2044,9 +2111,10 @@ mod tests {
     use crate::backend::{Backend, LocalBackend};
     use crate::runtime::SpawnMode;
     use crate::sandbox::{
-        HostPermissions, MAX_HOSTNAME_BYTES, MountOptions, OciRootfsSource, RootfsSource,
-        SandboxConfig, SandboxStatus, StatVirtualization, VolumeMount,
+        HostPermissions, MAX_HOSTNAME_BYTES, MountOptions, OciRootfsSource, PullPolicy,
+        RootfsSource, SandboxConfig, SandboxStatus, StatVirtualization, VolumeMount,
     };
+    use crate::snapshot::SnapshotReference;
 
     /// Open both pools at `db_path` for tests, with migrations applied.
     async fn open_test_pools(db_path: &std::path::Path) -> DbPools {
@@ -2467,6 +2535,101 @@ mod tests {
         backend
             .validate_sandbox_name_for_runtime("sdk-socket-test")
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_create_local_missing_snapshot_descriptor_preserves_replace_target() {
+        let temp = tempdir().unwrap();
+        let backend = Arc::new(
+            LocalBackend::builder()
+                .home(temp.path().join("home"))
+                .build()
+                .await
+                .unwrap(),
+        );
+        let pools = backend.db().await.unwrap();
+        let mut config = test_config_with_rootfs(
+            "replaceable",
+            RootfsSource::oci("example.invalid/snapshot-resolved:missing"),
+        );
+        // A regression must fail locally after target preparation, never pull or boot an image.
+        config.spec.pull_policy = PullPolicy::Never;
+        let sandbox_id = LocalBackend::insert_sandbox_record_with_status(
+            pools.write(),
+            &config,
+            SandboxStatus::Stopped,
+        )
+        .await
+        .unwrap();
+        let original = sandbox_entity::Entity::find_by_id(sandbox_id)
+            .one(pools.read())
+            .await
+            .unwrap()
+            .unwrap();
+        let sandbox_dir = backend.sandboxes_dir().join(&config.spec.name);
+        fs::create_dir_all(&sandbox_dir).unwrap();
+        let sentinel = sandbox_dir.join("keep");
+        fs::write(&sentinel, b"existing sandbox state").unwrap();
+
+        let snapshot_dir = temp.path().join("snapshot-without-descriptor");
+        fs::create_dir(&snapshot_dir).unwrap();
+        // A loose upper file is not an artifact and must not become an implicit fallback.
+        fs::write(snapshot_dir.join("upper.ext4"), b"unvalidated disk").unwrap();
+        config.snapshot_reference = Some(SnapshotReference::path(snapshot_dir.to_string_lossy()));
+        config.replace_existing = true;
+
+        let error = match backend
+            .create_sandbox(backend.clone(), config, SpawnMode::Attached, None)
+            .await
+        {
+            Ok(_) => panic!("snapshot descriptor must be validated before replacement"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(&error, crate::MicrosandboxError::SnapshotNotFound(_)),
+            "{error}"
+        );
+        assert_eq!(fs::read(sentinel).unwrap(), b"existing sandbox state");
+        let preserved = sandbox_entity::Entity::find_by_id(sandbox_id)
+            .one(pools.read())
+            .await
+            .unwrap()
+            .expect("snapshot resolution must not delete the existing sandbox row");
+        assert_eq!(preserved, original);
+    }
+
+    #[tokio::test]
+    async fn test_create_local_stored_snapshot_reference_error_is_not_ignored() {
+        let temp = tempdir().unwrap();
+        let backend = Arc::new(
+            LocalBackend::builder()
+                .home(temp.path().join("home"))
+                .build()
+                .await
+                .unwrap(),
+        );
+        let mut config = test_config_with_rootfs(
+            "missing-snapshot",
+            bind_rootfs(temp.path().join("missing-rootfs")),
+        );
+        config.snapshot_reference = Some(SnapshotReference::path(
+            temp.path().join("missing-snapshot").to_string_lossy(),
+        ));
+
+        let error = match backend
+            .create_sandbox(backend.clone(), config, SpawnMode::Attached, None)
+            .await
+        {
+            Ok(_) => panic!("stored snapshot references must be resolved before ordinary creation"),
+            Err(error) => error,
+        };
+
+        assert!(
+            matches!(&error, crate::MicrosandboxError::SnapshotNotFound(_)),
+            "{error}"
+        );
+        assert!(!backend.sandboxes_dir().join("missing-snapshot").exists());
     }
 
     #[tokio::test]

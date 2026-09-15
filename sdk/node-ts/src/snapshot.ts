@@ -1,9 +1,12 @@
-import { withMappedErrors } from "./internal/error-mapping.js";
+import { UnsupportedError } from "./errors.js";
+import { mapNapiError, withMappedErrors } from "./internal/error-mapping.js";
 import {
   napi,
   type NapiSnapshot,
   type NapiSnapshotArchive,
   type NapiSnapshotBuilderSetters,
+  type NapiSnapshotCopyBuilder,
+  type NapiSnapshotCopyBuilderSetters,
   type NapiSnapshotInfo,
   type NapiSnapshotVerifyReport,
 } from "./internal/napi.js";
@@ -49,7 +52,7 @@ export type SnapshotState =
     };
 
 /**
- * Bundle options for `Snapshot.save`.
+ * Bundle options for `Snapshot.save` and instance `saveTo` methods.
  */
 export interface SaveOpts {
   /** Omit disk layers and RAM objects supplied by this base; mutually exclusive with lastLayers/withParents. */
@@ -134,15 +137,19 @@ export class SnapshotArchive {
   }
 }
 
+/** Builder for copying a snapshot archive with replacement metadata. */
+export interface SnapshotCopyBuilder extends NapiSnapshotCopyBuilderSetters {
+  save(): Promise<void>;
+}
+
 /**
- * A snapshot artifact on disk.
+ * A backend-neutral snapshot artifact.
  *
  * Returned by `Snapshot.builder(name).create()`, `Snapshot.open(...)`,
  * and `SandboxHandle.snapshot(name)`.
  *
- * The artifact is a directory containing `snapshot.json` and either a disk
- * layer closure or a full checkpoint closure. The directory is the
- * source of truth; the local DB index is rebuildable via `Snapshot.reindex()`.
+ * The snapshot retains its originating backend internally and exposes a
+ * stable reference for subsequent lifecycle and restore operations.
  */
 export class Snapshot {
   /** @internal */
@@ -154,7 +161,7 @@ export class Snapshot {
   }
 
   /**
-   * Begin building a snapshot member; an omitted name is generated.
+   * Begin building a snapshot using the active backend; local names may be generated.
    *
    * The source sandbox is required:
    * `Snapshot.builder("clean").fromSandbox("box").create()`.
@@ -167,37 +174,25 @@ export class Snapshot {
   }
 
   /**
-   * Open a snapshot by path, group head, or `group:member` selector.
+   * Open an existing snapshot. Strings are interpreted by the active backend.
    *
-   * Cheap metadata validation only — does not read the upper file.
-   * Use `verify()` for content checks.
+   * Cheap metadata validation only — does not read snapshot contents.
    */
   static async open(pathOrName: string): Promise<Snapshot> {
     const inner = await withMappedErrors(() => napi.Snapshot.open(pathOrName));
     return new Snapshot(inner);
   }
 
-  /** Look up an indexed snapshot by digest, name, or path. */
+  /** Look up a snapshot using the active backend's public identifier. */
   static async get(nameOrDigest: string): Promise<SnapshotHandle> {
     const raw = await withMappedErrors(() => napi.Snapshot.get(nameOrDigest));
     return new SnapshotHandle(raw);
   }
 
-  /** List indexed snapshots from the local DB cache. */
+  /** List snapshots visible through the active backend. */
   static async list(): Promise<SnapshotHandle[]> {
     const infos = await withMappedErrors(() => napi.Snapshot.list());
     return infos.map(snapshotInfoToHandle);
-  }
-
-  /**
-   * Walk a directory and parse each subdirectory's manifest. Does
-   * not touch the index — useful for inspecting external snapshot
-   * collections that were never imported. Skips entries that don't
-   * look like snapshot artifacts.
-   */
-  static async listDir(dir: string): Promise<Snapshot[]> {
-    const raw = await withMappedErrors(() => napi.Snapshot.listDir(dir));
-    return raw.map((s) => new Snapshot(s));
   }
 
   /**
@@ -267,9 +262,29 @@ export class Snapshot {
   // Instance accessors
   //--------------------------------------------------------------------------
 
-  /** Path to the artifact directory. */
+  /** @deprecated Use `reference`. Throws UnsupportedError for remote snapshots. */
   get path(): string {
-    return this.inner.path;
+    try {
+      const path = this.inner.path;
+      if (path == null) {
+        throw new UnsupportedError(
+          "Snapshot has no local filesystem path; use reference instead.",
+        );
+      }
+      return path;
+    } catch (error) {
+      throw mapNapiError(error);
+    }
+  }
+
+  /** Stable value accepted by `Sandbox.restore()`. */
+  get reference(): string {
+    return this.inner.reference;
+  }
+
+  /** How the backend resolves `reference`. */
+  get referenceKind(): "id" | "path" {
+    return this.inner.referenceKind;
   }
 
   /** Outcome of the group head update performed by this capture. */
@@ -288,7 +303,7 @@ export class Snapshot {
     return this.inner.digest;
   }
 
-  /** Apparent size of the captured upper layer in bytes (sparse on disk). */
+  /** Backend-reported stored payload size in bytes. */
   get sizeBytes(): bigint | null {
     return this.inner.sizeBytes ?? null;
   }
@@ -423,16 +438,38 @@ export class Snapshot {
   }
 
   /**
-   * Recompute recorded payload integrity and compare it with the
-   * descriptor. Returns `notRecorded` without reading payload contents
-   * when creation did not request integrity.
-   *
- * Checkpoint-state verification remains unavailable until its provider
- * closure implementation lands.
+   * Parse snapshot artifacts found directly beneath a backend-visible directory.
+   * Throws `UnsupportedError` when the backend does not expose artifact files.
+   */
+  static async listDir(dir: string): Promise<Snapshot[]> {
+    const raw = await withMappedErrors(() => napi.Snapshot.listDir(dir));
+    return raw.map((snapshot) => new Snapshot(snapshot));
+  }
+
+  /**
+   * Bundle this snapshot into a `.tar.zst` archive.
+   * Throws `UnsupportedError` when the backend does not expose artifact archives.
+   */
+  async saveTo(out: string, opts?: SaveOpts): Promise<void> {
+    await withMappedErrors(() => this.inner.saveTo(out, opts));
+  }
+
+  /**
+   * Configure a new archive containing this snapshot's disk data and
+   * replacement labels and integrity metadata.
+   * Throws `UnsupportedError` when the backend does not expose artifact archives.
+   */
+  copyTo(outputArchivePath: string): SnapshotCopyBuilder {
+    return wrapCopyBuilder(this.inner.copyTo(outputArchivePath));
+  }
+
+  /**
+   * Verify this snapshot's recorded payload integrity.
+   * Throws `UnsupportedError` when the backend does not expose payload verification.
    */
   async verify(): Promise<SnapshotVerifyReport> {
-    const r = await withMappedErrors(() => this.inner.verify());
-    return verifyReportToTs(r);
+    const report = await withMappedErrors(() => this.inner.verify());
+    return verifyReportToTs(report);
   }
 }
 
@@ -453,6 +490,13 @@ function wrapBuilder(nb: InstanceType<typeof napi.SnapshotBuilder>): SnapshotBui
     return new SnapshotArchive(inner);
   };
   return nb as unknown as SnapshotBuilder;
+}
+
+/** @internal */
+function wrapCopyBuilder(builder: NapiSnapshotCopyBuilder): SnapshotCopyBuilder {
+  const originalSave = builder.save.bind(builder);
+  builder.save = () => withMappedErrors(originalSave);
+  return builder;
 }
 
 /** @internal */

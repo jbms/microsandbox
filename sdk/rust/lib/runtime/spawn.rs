@@ -78,6 +78,7 @@ use crate::error::{Operation, UnsupportedReason};
 #[cfg(windows)]
 use crate::runtime::handle::WindowsJob;
 use crate::runtime::handle::{ProcessHandle, StartupProcess};
+use crate::timing;
 use crate::{
     MicrosandboxError, MicrosandboxResult,
     backend::LocalBackend,
@@ -419,7 +420,12 @@ pub async fn spawn_sandbox(
     // Stopped-safe preparation: a `--next-start` upper grow persists only the
     // desired size, so the file itself grows here, before any virtio device
     // attaches the image.
-    prepare_oci_upper(config, &sandbox_dir).await?;
+    timing::measure(
+        &config.spec.name,
+        "writable_disk_grow",
+        prepare_oci_upper(config, &sandbox_dir),
+    )
+    .await?;
 
     // Write scripts to the runtime scripts directory.
     for (name, content) in &config.spec.runtime.scripts {
@@ -5267,7 +5273,7 @@ mod tests {
                 name: "test".into(),
                 image: RootfsSource::Oci(OciRootfsSource {
                     reference: "alpine".into(),
-                    root_disk: None,
+                    root_disk: Some(crate::sandbox::RootDisk::tmpfs(512)),
                 }),
                 resources: microsandbox_types::SandboxResources {
                     memory_mib: 1024,

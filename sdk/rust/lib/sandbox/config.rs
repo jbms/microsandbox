@@ -20,8 +20,9 @@ use microsandbox_types::RegistryAuth;
 use typed_path::Utf8UnixPath;
 
 #[cfg(feature = "local")]
-use super::types::RootDisk;
-use super::types::{MountOptions, RootfsSource, VolumeMount};
+use super::types::RootfsSource;
+use super::types::{MountOptions, RootDisk, VolumeMount};
+use crate::snapshot::SnapshotReference;
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -43,12 +44,11 @@ pub(crate) const DEFAULT_BIND_QUOTA_MIB: u32 = DEFAULT_OCI_UPPER_SIZE_MIB;
 /// Default timeout given to the existing sandbox during a `.replace()`
 /// create before it is force-killed.
 ///
-/// Distinct from [`SandboxHandle::stop`]'s timeout: this one applies
+/// Distinct from [`SandboxHandle::stop_with_timeout`]'s explicit deadline: this applies
 /// to the builder's override-an-existing-sandbox flow, not the
-/// user-facing stop. They share a numeric value today by coincidence,
-/// not by design.
+/// user-facing stop. Ordinary `stop()` waits without an implicit deadline or force-kill.
 ///
-/// [`SandboxHandle::stop`]: super::SandboxHandle::stop
+/// [`SandboxHandle::stop_with_timeout`]: super::SandboxHandle::stop_with_timeout
 pub const DEFAULT_REPLACE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 // Compile-time defaults for `SandboxConfig` serde. Serde's `#[serde(default
@@ -200,6 +200,13 @@ pub struct SandboxConfig {
     #[serde(skip)]
     pub(crate) snapshot_upper_source: Option<PathBuf>,
 
+    /// Original backend-neutral reference supplied to `Sandbox::restore_ref`.
+    ///
+    /// The selected backend resolves this into its restore configuration. It
+    /// is operation-only and is never persisted.
+    #[serde(skip)]
+    pub(crate) snapshot_reference: Option<SnapshotReference>,
+
     /// Immutable installed-snapshot layers to materialize into child-owned root storage.
     ///
     /// Transient: paths remain read-only sources until local create copies or links them and adds
@@ -282,6 +289,11 @@ pub struct SandboxConfig {
     #[serde(skip)]
     pub(crate) restore_overrides: RestoreOverrideIntent,
 
+    /// Destination boot settings that require scope admission before snapshot materialization.
+    /// Captured execution does not rerun guest bootstrap; explicit choices cannot be ignored.
+    #[serde(skip)]
+    pub(crate) restore_boot_overrides: super::restore_builder::RestoreBootOverrides,
+
     /// Transient process-launch intent for the current create operation.
     #[serde(skip)]
     pub(crate) launch_intent: LaunchIntent,
@@ -346,6 +358,7 @@ impl SandboxConfig {
             config.snapshot_upper_layers.clear();
         }
         config.restore_overrides = RestoreOverrideIntent::default();
+        config.restore_boot_overrides = Default::default();
         config.launch_intent = LaunchIntent::None;
         config.launch_cmd_before_override = None;
         config.init_owns_workload = false;
@@ -578,7 +591,8 @@ impl SandboxConfig {
             ));
         }
 
-        if self.snapshot_upper_source.is_some()
+        if self.snapshot_reference.is_some()
+            || self.snapshot_upper_source.is_some()
             || !self.snapshot_root_layer_sources.is_empty()
             || self.snapshot_archive_source.is_some()
             || self.checkpoint_restore.is_some()
@@ -611,10 +625,14 @@ impl SandboxConfig {
         Ok(())
     }
 
-    /// Apply runtime defaults that should exist for OCI sandboxes unless the
-    /// user explicitly overrode them.
+    /// Keep disk-backed OCI temporary files on the writable disk. Only a
+    /// deliberately RAM-backed root receives the historical bounded tmpfs.
+    /// Explicit mounts, including tmpfs stored by older versions, are retained.
     pub(crate) fn apply_runtime_defaults(&mut self) {
-        if !matches!(self.spec.image, RootfsSource::Oci(_)) {
+        if !matches!(
+            self.spec.image.oci_root_disk(),
+            Some(RootDisk::Tmpfs { .. })
+        ) {
             return;
         }
 
@@ -812,6 +830,7 @@ impl Default for SandboxConfig {
             replace_with_timeout: DEFAULT_REPLACE_TIMEOUT,
             slug: None,
             manifest_digest: None,
+            snapshot_reference: None,
             snapshot_upper_source: None,
             #[cfg(feature = "local")]
             snapshot_root_layer_sources: Vec::new(),
@@ -835,6 +854,7 @@ impl Default for SandboxConfig {
             #[cfg(feature = "local")]
             snapshot_upper_layers: Vec::new(),
             restore_overrides: RestoreOverrideIntent::default(),
+            restore_boot_overrides: Default::default(),
             launch_intent: LaunchIntent::None,
             launch_cmd_before_override: None,
             init_owns_workload: false,
@@ -858,6 +878,7 @@ mod tests {
         HandoffInit, MountOptions, NamedVolumeMode, RootDisk, RootfsSource, StatVirtualization,
         VolumeMount,
     };
+    use crate::snapshot::SnapshotReference;
     use microsandbox_image::ImageConfig;
     use microsandbox_types::{
         EnvVar, NamedVolumeCreate, SandboxLogLevel, SandboxPolicy, SandboxResources,
@@ -1251,6 +1272,29 @@ mod tests {
     }
 
     #[test]
+    fn test_restore_boot_intent_is_operation_local() {
+        let config = SandboxConfig {
+            restore_boot_overrides: super::super::restore_builder::RestoreBootOverrides {
+                security: true,
+            },
+            ..Default::default()
+        };
+
+        // A later ordinary start must not replay the previous restore's admission decision.
+        assert!(config.restore_boot_overrides.security);
+        assert!(
+            !config
+                .clone_for_persistence()
+                .restore_boot_overrides
+                .security
+        );
+        let encoded = serde_json::to_value(&config).unwrap();
+        assert!(encoded.get("restore_boot_overrides").is_none());
+        let decoded: SandboxConfig = serde_json::from_value(encoded).unwrap();
+        assert!(!decoded.restore_boot_overrides.security);
+    }
+
+    #[test]
     fn test_clone_for_persistence_keeps_user_init_args() {
         let config = SandboxConfig {
             spec: SandboxSpec {
@@ -1631,7 +1675,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_runtime_defaults_adds_tmpfs_for_oci_tmp() {
+    fn test_apply_runtime_defaults_adds_tmpfs_for_ram_backed_oci_tmp() {
         let mut config = SandboxConfig {
             spec: SandboxSpec {
                 image: RootfsSource::oci("python:3.12"),
@@ -1644,6 +1688,9 @@ mod tests {
             ..Default::default()
         };
 
+        if let RootfsSource::Oci(oci) = &mut config.spec.image {
+            oci.root_disk = Some(RootDisk::tmpfs(1024));
+        }
         config.apply_runtime_defaults();
 
         assert_eq!(config.spec.mounts.len(), 1);
@@ -1658,6 +1705,40 @@ mod tests {
                 assert_eq!(*options, MountOptions::default());
             }
             mount => panic!("expected tmpfs mount, got {mount:?}"),
+        }
+    }
+
+    #[test]
+    fn disk_backed_tmp_uses_root_disk_and_explicit_tmpfs_survives_restart() {
+        for root_disk in [
+            None,
+            Some(RootDisk::managed(16384)),
+            Some(RootDisk::flat(16384)),
+        ] {
+            let mut config = SandboxConfig::default();
+            config.spec.image = RootfsSource::oci("node:22");
+            if let RootfsSource::Oci(oci) = &mut config.spec.image {
+                oci.root_disk = root_disk;
+            }
+            config.apply_runtime_defaults();
+            assert!(config.spec.mounts.is_empty());
+            config.spec.mounts.push(VolumeMount::Tmpfs {
+                guest: "/tmp".into(),
+                size_mib: Some(128),
+                options: MountOptions::default(),
+            });
+            // Persisted mounts from older versions remain explicit on restart.
+            let mut restarted: SandboxConfig =
+                serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+            restarted.apply_runtime_defaults();
+            assert_eq!(restarted.spec.mounts.len(), 1);
+            assert!(matches!(
+                restarted.spec.mounts[0],
+                VolumeMount::Tmpfs {
+                    size_mib: Some(128),
+                    ..
+                }
+            ));
         }
     }
 
@@ -1778,13 +1859,13 @@ mod tests {
     }
 
     #[test]
-    fn test_apply_rootfs_defaults_skips_snapshot_upper_source() {
+    fn test_apply_rootfs_defaults_skips_snapshot_reference() {
         let mut config = SandboxConfig {
             spec: SandboxSpec {
                 image: RootfsSource::oci("python:3.12"),
                 ..Default::default()
             },
-            snapshot_upper_source: Some("/tmp/upper.ext4".into()),
+            snapshot_reference: Some(SnapshotReference::path("/tmp/snapshot")),
             ..Default::default()
         };
 

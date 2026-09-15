@@ -647,26 +647,20 @@ impl SandboxHandle {
         self.connect().await?.touch().await
     }
 
-    /// Snapshot this sandbox to a bare name under the default snapshots
-    /// directory (`~/.microsandbox/snapshots/<name>/`).
+    /// Snapshot this sandbox under a bare name using the handle's backend.
     ///
     /// Captures disk only, including running and paused sources. A live cut is
     /// crash-consistent and preserves the source's running/paused state.
-    /// **Local handles only** — cloud snapshot semantics are deferred.
-    #[cfg(feature = "local")]
+    /// Cloud uses managed storage and its own disk-capture admission rules.
     pub async fn snapshot(
         &self,
         name: &str,
     ) -> MicrosandboxResult<super::super::snapshot::Snapshot> {
-        if self.local().is_none() {
-            return Err(MicrosandboxError::local_only(
-                Operation::SandboxHandleSnapshot,
-            ));
-        }
         use super::super::snapshot::Snapshot;
-        Snapshot::builder(name)
-            .from_sandbox(&self.name)
-            .create()
+        let config = Snapshot::builder(name).from_sandbox(&self.name).build()?;
+        self.backend
+            .snapshots()
+            .create(self.backend.clone(), config)
             .await
     }
 

@@ -8,7 +8,7 @@ mod domain;
 mod error;
 pub mod modify;
 mod registry;
-mod snapshot;
+pub mod snapshot;
 mod validation;
 
 #[cfg(feature = "ts")]
@@ -19,12 +19,15 @@ pub mod typescript;
 //--------------------------------------------------------------------------------------------------
 
 pub use cloud::{
-    CloudCreateSandboxRequest, CloudCreateSandboxResponse, CloudDiskImageFormat, CloudErrorBody,
-    CloudErrorDetails, CloudHostPattern, CloudMessageResponse, CloudNetworkSpec, CloudPaginated,
-    CloudPatch, CloudPullPolicy, CloudRlimit, CloudRlimitResource, CloudRootfsSource,
+    CloudCreateSandboxRequest, CloudCreateSandboxResponse, CloudCreateSnapshotRequest,
+    CloudDiskImageFormat, CloudErrorBody, CloudErrorDetails, CloudHostPattern,
+    CloudMessageResponse, CloudNetworkSpec, CloudPaginated, CloudPatch, CloudPullPolicy,
+    CloudRlimit, CloudRlimitResource, CloudRootfsSource, CloudSandboxComputeResources,
     CloudSandboxResources, CloudSandboxRuntimeOptions, CloudSandboxSpec, CloudSandboxStatus,
     CloudSandboxStatusReason, CloudSecretEntry, CloudSecretSource, CloudSecretsConfig,
-    CloudViolationAction, CloudVolumeMount,
+    CloudSnapshot, CloudSnapshotDetails, CloudSnapshotKind, CloudSnapshotLocation,
+    CloudSnapshotOperation, CloudSnapshotOperationStatus, CloudSnapshotSpec, CloudViolationAction,
+    CloudVolumeMount,
 };
 #[doc(hidden)]
 pub use command::{CommandResolutionError, ResolvedCommand, resolve_default_command};
@@ -47,7 +50,7 @@ pub use domain::{
     TransparentHugePagePolicy, VolumeKind, VolumeMount, VolumeSpec, VsockRouteSpec,
     VsockSocketType, VsockSpec, VsockSpecPatch, canonicalize_volume_mounts, owned_volume_mount_id,
 };
-pub use error::{TypesError, TypesResult};
+pub use error::{SnapshotManifestError, SnapshotManifestResult, TypesError, TypesResult};
 pub use modify::{
     ChangeKind, ConfigPlannedChange, ModificationConflict, ModificationDisposition,
     ModificationPolicy, ModificationWarning, PlannedChange, ResourceConvergenceState, ResourceKind,
@@ -55,6 +58,7 @@ pub use modify::{
     SecretModificationPatch, SecretPlannedChange, SecretSource,
 };
 pub use registry::RegistryAuth;
+pub use snapshot::manifest::Manifest as SnapshotManifest;
 pub use snapshot::{
     DiskCompactionDiskResult, DiskCompactionResult, DiskCompactionTarget,
     ExternalMountRestorePolicy, ExternalMountWarning,

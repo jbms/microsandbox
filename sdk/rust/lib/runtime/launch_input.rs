@@ -44,6 +44,27 @@ pub(super) fn encode(launch: &LaunchConfig, contract: LaunchContract) -> Microsa
     if launch.execution != microsandbox_runtime::launch::ExecutionIntent::Boot {
         return unsupported("execution restore");
     }
+    #[cfg(feature = "net")]
+    if let Some(limit) = launch
+        .network
+        .as_ref()
+        .and_then(|network| network.config().max_connections)
+    {
+        // Historical engines treat zero as a closed admission budget, reject caps over
+        // 4096, and clamp multi-tenant budgets to 256. Preserve explicit intent instead
+        // of serializing the new meaning into an older, numerically identical field.
+        let Some(cap) = limit.cap() else {
+            return unsupported("unlimited network connections");
+        };
+        if cap.get() > 4096 {
+            return unsupported("network connection limits above 4096");
+        }
+        if launch.deployment_profile == microsandbox_types::DeploymentProfile::MultiTenant
+            && cap.get() > 256
+        {
+            return unsupported("multi-tenant network connection limits above 256");
+        }
+    }
     if !launch.owned_volumes.is_empty() {
         return unsupported("sandbox-owned volumes");
     }
@@ -119,6 +140,11 @@ pub(super) fn encode(launch: &LaunchConfig, contract: LaunchContract) -> Microsa
         } else {
             &mut value["network"]
         };
+        // Pin the historical default at the boundary; omission on the current contract
+        // intentionally has a different meaning and must not broaden an old launch.
+        if network["max_connections"].is_null() {
+            network["max_connections"] = json!(256);
+        }
         if let Some(secrets) = network.get_mut("secrets").and_then(Value::as_object_mut) {
             if let Some(action) = secrets.remove("violation_action") {
                 secrets.insert("on_violation".into(), action);
@@ -413,6 +439,82 @@ fn unsupported<T>(feature: &str) -> MicrosandboxResult<T> {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "net")]
+    #[test]
+    fn legacy_network_limits_reject_changed_meanings_before_launch() {
+        use microsandbox_network::config::{EnvNetworkSecretResolver, NetworkConfig};
+        use microsandbox_types::DeploymentProfile;
+
+        for profile in [
+            DeploymentProfile::SingleTenant,
+            DeploymentProfile::MultiTenant,
+        ] {
+            for requested in [
+                None,
+                Some(0),
+                Some(1),
+                Some(256),
+                Some(257),
+                Some(4096),
+                Some(4097),
+            ] {
+                let network: NetworkConfig =
+                    serde_json::from_value(json!({"max_connections": requested})).unwrap();
+                let launch = LaunchConfig {
+                    network: Some(network.resolve(&EnvNetworkSecretResolver).unwrap()),
+                    deployment_profile: profile,
+                    ..Default::default()
+                };
+                // Current runtimes implement every explicit value, including zero/unlimited.
+                assert_eq!(
+                    encode(
+                        &launch,
+                        LaunchContract {
+                            patch: 18,
+                            machine: true
+                        }
+                    )
+                    .unwrap(),
+                    serde_json::to_value(&launch).unwrap(),
+                );
+
+                for patch in 0..=18 {
+                    if profile == DeploymentProfile::MultiTenant && patch < 9 {
+                        // Those releases predate deployment profiles entirely.
+                        continue;
+                    }
+                    let result = encode(
+                        &launch,
+                        LaunchContract {
+                            patch,
+                            machine: false,
+                        },
+                    );
+                    let unsupported = requested.is_some_and(|limit| {
+                        limit == 0
+                            || limit > 4096
+                            || (profile == DeploymentProfile::MultiTenant && limit > 256)
+                    });
+                    if unsupported {
+                        let error = result.unwrap_err().to_string();
+                        assert!(error.contains("network connection"), "{error}");
+                        assert!(error.contains("newer runtime launch contract"), "{error}");
+                    } else {
+                        let value = result.unwrap();
+                        let network = if patch >= 17 {
+                            &value["network"]["config"]
+                        } else {
+                            &value["network"]
+                        };
+                        // Omission pins the historical default. Representable explicit
+                        // budgets must survive the historical launch transformation.
+                        assert_eq!(network["max_connections"], json!(requested.unwrap_or(256)));
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn owned_storage_is_never_silently_dropped_for_released_runtimes() {
         let launch = LaunchConfig {
@@ -568,6 +670,7 @@ mod tests {
             )
             .unwrap();
             let mut expected = expected.clone();
+            expected["config"]["max_connections"] = json!(256);
             if let Some(secrets) = expected["config"]
                 .get_mut("secrets")
                 .and_then(Value::as_object_mut)

@@ -222,13 +222,82 @@ fn duplicate_json_policy_keys_are_rejected() {
 
 #[cfg(feature = "net")]
 #[test]
+fn legacy_connection_limits_keep_historical_budgets_and_refuse_ambiguous_zero() {
+    use microsandbox_network::config::ConnectionLimit;
+
+    // Include real released producer records, not only current serializers. The
+    // v0.6.0 fixture covers the older environment-based launch shape as well.
+    let inputs = [
+        historical(vec![]),
+        serde_json::from_slice(include_bytes!(
+            "../../../tests/fixtures/launch-v0.6.10.json"
+        ))
+        .unwrap(),
+        serde_json::from_slice(include_bytes!(
+            "../../../tests/fixtures/launch-v0.6.18.json"
+        ))
+        .unwrap(),
+    ];
+    for input in inputs {
+        for profile in ["single_tenant", "multi_tenant"] {
+            for requested in [None, Some(1), Some(256), Some(257), Some(4096)] {
+                let mut value = input.clone();
+                value["deployment_profile"] = json!(profile);
+                // Preserve each historical producer's flat/resolved shape.
+                let resolved = value["network"].get("config").is_some();
+                let network = json!({"max_connections": requested});
+                value["network"] = if resolved {
+                    json!({"config": network, "outbound_proxy": null})
+                } else {
+                    network
+                };
+                let launch = decode(&value).unwrap();
+                let expected = requested.unwrap_or(256);
+                let expected = if profile == "multi_tenant" {
+                    expected.min(256)
+                } else {
+                    expected
+                };
+                assert_eq!(
+                    launch.network.unwrap().config().max_connections,
+                    Some(ConnectionLimit::from(expected)),
+                );
+            }
+        }
+        for requested in [json!(0), json!(4097), json!(-1), json!("unlimited")] {
+            let mut value = input.clone();
+            value["network"] = json!({"max_connections": requested});
+            assert!(decode(&value).is_err(), "{requested}");
+        }
+    }
+}
+
+#[cfg(feature = "net")]
+#[test]
+fn current_launch_keeps_new_connection_limit_semantics() {
+    use microsandbox_network::config::ConnectionLimit;
+
+    for requested in [None, Some(0), Some(4097)] {
+        let mut value = serde_json::to_value(LaunchConfig::default()).unwrap();
+        value["network"] =
+            json!({"config": {"max_connections": requested}, "outbound_proxy": null});
+        let launch = decode(&value).unwrap();
+        assert_eq!(
+            launch.network.unwrap().config().max_connections,
+            requested.map(ConnectionLimit::from),
+        );
+    }
+}
+
+#[cfg(feature = "net")]
+#[test]
 fn resolved_network_preserves_policy_and_refuses_unavailable_features() {
     let mut value = historical(vec![]);
     value["network"] =
         json!({"config":{"enabled":false,"max_connections":12},"outbound_proxy":null});
     let net = decode(&value).unwrap().network.unwrap();
     assert!(!net.config().enabled);
-    assert_eq!(net.config().max_connections, Some(12));
+    assert_eq!(net.config().max_connections, Some(12.into()));
     value["network"]["outbound_proxy"] = json!({"secret":"secret-marker"});
     let err = decode(&value).unwrap_err();
     assert!(!err.contains("secret-marker"));

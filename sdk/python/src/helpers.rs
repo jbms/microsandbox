@@ -2,10 +2,12 @@ use microsandbox::sandbox::{
     CpuPlacement, DeploymentProfile, NetworkPolicy, Patch, PullPolicy, SandboxBuilder,
     SecretSource, SecurityProfile, TransparentHugePagePolicy,
 };
-use microsandbox::{LogLevel, RegistryAuth};
+use microsandbox::{LogLevel, RegistryAuth, SnapshotReference};
 use microsandbox_network::dns::Nameserver;
 use pyo3::prelude::*;
 use pyo3::types::{PyByteArray, PyBytes, PyDict, PyList, PyModule};
+
+use crate::snapshot::{PySnapshot, PySnapshotHandle};
 
 //--------------------------------------------------------------------------------------------------
 // Constants
@@ -172,23 +174,38 @@ pub(crate) fn restore_builder_from_args(
     name: String,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<microsandbox::sandbox::RestoreBuilder> {
-    let snapshot = if let Ok(value) = snapshot.extract::<String>() {
-        value
+    let snapshot = if let Ok(value) = snapshot.extract::<PyRef<'_, PySnapshot>>() {
+        value.rust_reference()
+    } else if let Ok(value) = snapshot.extract::<PyRef<'_, PySnapshotHandle>>() {
+        value.rust_reference()
+    } else if let Ok(value) = snapshot.extract::<String>() {
+        SnapshotReference::auto(value)
     } else {
-        snapshot
+        let path = snapshot
             .call_method0("__fspath__")
             .and_then(|path| path.extract::<String>())
             .map_err(|_| {
-                pyo3::exceptions::PyTypeError::new_err("snapshot must be str or os.PathLike[str]")
-            })?
+                pyo3::exceptions::PyTypeError::new_err(
+                    "snapshot must be Snapshot, SnapshotHandle, str, or os.PathLike[str]",
+                )
+            })?;
+        SnapshotReference::path(path)
     };
-    let mut builder = microsandbox::Sandbox::restore(snapshot).name(name);
+    let mut builder = microsandbox::Sandbox::restore_ref(snapshot).name(name);
     let Some(kwargs) = kwargs else {
         return Ok(builder);
     };
     for (key, _) in kwargs.iter() {
         let key = key.extract::<String>()?;
         if ![
+            "cpus",
+            "memory",
+            "network_policy",
+            "max_connections",
+            "disable_network",
+            "security",
+            "max_duration",
+            "idle_timeout",
             "forked",
             "disk_only",
             "snapshot_base",
@@ -207,6 +224,45 @@ pub(crate) fn restore_builder_from_args(
                 "unexpected restore option: {key}"
             )));
         }
+    }
+    if let Some(cpus) = extract_opt::<u8>(kwargs, "cpus")? {
+        builder = builder.cpus(cpus);
+    }
+    if let Some(memory) = extract_opt::<u32>(kwargs, "memory")? {
+        builder = builder.memory(memory);
+    }
+    if let Some(value) = kwargs.get_item("network_policy")?.filter(|v| !v.is_none()) {
+        // Accept only the existing policy value, not a Network config that could alter bootstrap.
+        let policy = config_dict(&value, "NetworkPolicy")?;
+        let net = PyDict::new(kwargs.py());
+        net.set_item("custom_policy", policy)?;
+        if let Some(policy) = parse_network_policy(&net)? {
+            builder = builder.network_policy(policy);
+        }
+    }
+    if let Some(count) = extract_opt::<usize>(kwargs, "max_connections")? {
+        builder = builder.max_connections(count);
+    }
+    if extract_opt::<bool>(kwargs, "disable_network")?.unwrap_or(false) {
+        builder = builder.disable_network();
+    }
+    if let Some(value) = kwargs.get_item("security")?.filter(|v| !v.is_none()) {
+        let profile = extract_str_enum(&value, "SecurityProfile")?;
+        builder = builder.security(match profile.as_str() {
+            "default" => SecurityProfile::Default,
+            "restricted" => SecurityProfile::Restricted,
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "invalid security profile",
+                ));
+            }
+        });
+    }
+    if let Some(seconds) = restore_duration(kwargs, "max_duration")? {
+        builder = builder.max_duration(seconds);
+    }
+    if let Some(seconds) = restore_duration(kwargs, "idle_timeout")? {
+        builder = builder.idle_timeout(seconds);
     }
     if extract_opt::<bool>(kwargs, "forked")?.unwrap_or(false) {
         builder = builder.forked();
@@ -263,6 +319,21 @@ pub(crate) fn restore_builder_from_args(
         builder = apply_vsock_routes(builder, &vsock)?;
     }
     Ok(builder)
+}
+
+/// Keep explicit zero, and reject non-finite or negative durations before native conversion.
+fn restore_duration(kwargs: &Bound<'_, PyDict>, name: &str) -> PyResult<Option<u64>> {
+    extract_opt::<f64>(kwargs, name)?
+        .map(|seconds| {
+            if !seconds.is_finite() || seconds < 0.0 || seconds >= u64::MAX as f64 {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "{name} must be finite, non-negative, and fit in seconds"
+                )));
+            }
+            // Do not truncate a positive sub-second limit into immediate expiry.
+            Ok(seconds.ceil() as u64)
+        })
+        .transpose()
 }
 
 /// Build a `SandboxBuilder` from the `(name, **kwargs)` form of
@@ -1239,10 +1310,7 @@ fn apply_patch(
 // Functions: Network
 //--------------------------------------------------------------------------------------------------
 
-fn apply_network(
-    mut builder: microsandbox::sandbox::SandboxBuilder,
-    net: &Bound<'_, PyDict>,
-) -> PyResult<microsandbox::sandbox::SandboxBuilder> {
+fn parse_network_policy(net: &Bound<'_, PyDict>) -> PyResult<Option<NetworkPolicy>> {
     // Parse bulk deny-Domain rules up-front so PyValueError propagates
     // cleanly rather than being swallowed inside the builder closure.
     let mut bulk_deny_rules: Vec<microsandbox_network::policy::Rule> = Vec::new();
@@ -1267,8 +1335,6 @@ fn apply_network(
             ));
         }
     }
-    let mut policy_set = false;
-
     if let Some(legacy) = net.get_item("policy")?
         && !legacy.is_none()
     {
@@ -1384,20 +1450,29 @@ fn apply_network(
             default_ingress,
             rules: combined,
         };
-        builder = builder.network(|n| n.policy(policy));
-        policy_set = true;
+        return Ok(Some(policy));
     }
 
     // No custom policy was specified, but legacy DNS block
     // entries were. Use permissive defaults so the rest of the network
     // keeps working — preserves the legacy "full network minus blocked
     // domains" semantics.
-    if !policy_set && !bulk_deny_rules.is_empty() {
+    if !bulk_deny_rules.is_empty() {
         let policy = NetworkPolicy {
             default_egress: microsandbox_network::policy::Action::Allow,
             default_ingress: microsandbox_network::policy::Action::Allow,
             rules: bulk_deny_rules,
         };
+        return Ok(Some(policy));
+    }
+    Ok(None)
+}
+
+fn apply_network(
+    mut builder: microsandbox::sandbox::SandboxBuilder,
+    net: &Bound<'_, PyDict>,
+) -> PyResult<microsandbox::sandbox::SandboxBuilder> {
+    if let Some(policy) = parse_network_policy(net)? {
         builder = builder.network(|n| n.policy(policy));
     }
 

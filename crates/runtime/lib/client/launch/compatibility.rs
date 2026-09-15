@@ -54,9 +54,33 @@ pub(super) fn decode(bytes: &[u8]) -> Result<LaunchConfig, String> {
         fields.insert("writeback_lease_dir".into(), Value::String(String::new()));
     }
     #[cfg(feature = "net")]
+    let multi_tenant =
+        fields.get("deployment_profile").and_then(Value::as_str) == Some("multi_tenant");
+    #[cfg(feature = "net")]
     if let Some(network) = fields.get_mut("network") {
         if !network.is_null() && network.get("config").is_none() {
             *network = serde_json::json!({"config":network.take(), "outbound_proxy":null});
+        }
+        if let Some(config) = network.get_mut("config").and_then(Value::as_object_mut) {
+            // The legacy field used zero to admit no connections and omitted limits
+            // defaulted to 256. A current zero instead means unlimited: refuse that
+            // ambiguous request, and retain the historical default and tenant clamp.
+            let limit = match config.get("max_connections") {
+                None | Some(Value::Null) => 256,
+                Some(value) => value
+                    .as_u64()
+                    .ok_or("invalid legacy network connection limit")?,
+            };
+            if limit == 0 {
+                return Err("legacy max_connections=0 cannot be represented by this runtime; use a current SDK and an explicit network policy".into());
+            }
+            if limit > 4096 {
+                return Err("legacy network connection limit exceeds 4096".into());
+            }
+            config.insert(
+                "max_connections".into(),
+                Value::from(if multi_tenant { limit.min(256) } else { limit }),
+            );
         }
         if let Some(secrets) = network
             .pointer_mut("/config/secrets")

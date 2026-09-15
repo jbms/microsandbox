@@ -7,7 +7,8 @@ use microsandbox::Sandbox;
 use microsandbox::sandbox::{ExternalMountRestorePolicy, RestoreBuilder};
 
 use super::{
-    FfiError, MountSpec, PortBindingOpts, VsockRouteOpts, cstr, parse_log_level, register, run_c,
+    CustomNetworkPolicy, FfiError, MountSpec, PortBindingOpts, VsockRouteOpts, cstr,
+    parse_custom_network_policy, parse_log_level, parse_security_profile, register, run_c,
     volume_mount,
 };
 
@@ -19,6 +20,17 @@ use super::{
 #[serde(deny_unknown_fields)]
 struct RestoreOptions {
     snapshot: String,
+    snapshot_reference_kind: Option<String>,
+    cpus: Option<u8>,
+    memory_mib: Option<u32>,
+    #[serde(default, deserialize_with = "deserialize_network_policy")]
+    network_policy: Option<CustomNetworkPolicy>,
+    max_connections: Option<usize>,
+    #[serde(default)]
+    disable_network: bool,
+    security_profile: Option<String>,
+    max_duration_secs: Option<u64>,
+    idle_timeout_secs: Option<u64>,
     creation_progress: Option<u64>,
     #[serde(default)]
     forked: bool,
@@ -44,8 +56,64 @@ struct RestoreOptions {
 // Functions
 //--------------------------------------------------------------------------------------------------
 
+/// Keep the shared rule parser, but reject broad network fields at the restore boundary.
+fn deserialize_network_policy<'de, D>(
+    deserializer: D,
+) -> Result<Option<CustomNetworkPolicy>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::{Deserialize, de::Error};
+
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    value
+        .map(|value| {
+            let fields = value
+                .as_object()
+                .ok_or_else(|| D::Error::custom("restore network policy must be an object"))?;
+            if fields
+                .keys()
+                .any(|key| !matches!(key.as_str(), "default_egress" | "default_ingress" | "rules"))
+            {
+                return Err(D::Error::custom(
+                    "restore network policy accepts only default actions and rules",
+                ));
+            }
+            serde_json::from_value(value).map_err(D::Error::custom)
+        })
+        .transpose()
+}
+
 fn builder(name: String, opts: &RestoreOptions) -> Result<RestoreBuilder, FfiError> {
-    let mut builder = Sandbox::restore(&opts.snapshot).name(name);
+    let reference = super::parse_snapshot_reference(
+        opts.snapshot.clone(),
+        opts.snapshot_reference_kind.as_deref().unwrap_or(""),
+    )?;
+    let mut builder = Sandbox::restore_ref(reference).name(name);
+    if let Some(cpus) = opts.cpus {
+        builder = builder.cpus(cpus);
+    }
+    if let Some(memory) = opts.memory_mib {
+        builder = builder.memory(memory);
+    }
+    if let Some(policy) = &opts.network_policy {
+        builder = builder.network_policy(parse_custom_network_policy(policy, Vec::new())?);
+    }
+    if let Some(count) = opts.max_connections {
+        builder = builder.max_connections(count);
+    }
+    if opts.disable_network {
+        builder = builder.disable_network();
+    }
+    if let Some(profile) = &opts.security_profile {
+        builder = builder.security(parse_security_profile(profile)?);
+    }
+    if let Some(seconds) = opts.max_duration_secs {
+        builder = builder.max_duration(seconds);
+    }
+    if let Some(seconds) = opts.idle_timeout_secs {
+        builder = builder.idle_timeout(seconds);
+    }
     if opts.forked {
         builder = builder.forked();
     }
@@ -139,9 +207,46 @@ mod tests {
     use super::*;
     #[test]
     fn restore_rejects_fresh_boot_options() {
-        for field in ["image", "memory_mib", "cmd", "replace", "detached"] {
+        for field in [
+            "image",
+            "network",
+            "cmd",
+            "replace",
+            "detached",
+            "entrypoint",
+        ] {
             let mut value = serde_json::json!({"snapshot":"saved"});
             value[field] = serde_json::Value::Null;
+            assert!(
+                serde_json::from_value::<RestoreOptions>(value).is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn restore_parses_explicit_destination_controls() {
+        let options: RestoreOptions = serde_json::from_value(serde_json::json!({
+            "snapshot": "baseline", "cpus": 2, "memory_mib": 512,
+            "network_policy": {"default_egress": "deny", "default_ingress": "deny", "rules": []},
+            "max_connections": 0, "disable_network": true, "security_profile": "default",
+            "max_duration_secs": 0, "idle_timeout_secs": 0
+        }))
+        .unwrap();
+        assert_eq!(options.cpus, Some(2));
+        assert_eq!(options.memory_mib, Some(512));
+        assert_eq!(options.max_connections, Some(0));
+        assert_eq!(options.max_duration_secs, Some(0));
+        assert_eq!(options.idle_timeout_secs, Some(0));
+        assert!(builder("destination".into(), &options).is_ok());
+    }
+
+    #[test]
+    fn restore_rejects_nested_boot_network_options() {
+        for field in ["tls", "dns", "ports", "ipv4_pool", "secrets"] {
+            let mut policy = serde_json::json!({"default_egress":"deny", "rules":[]});
+            policy[field] = serde_json::json!({});
+            let value = serde_json::json!({"snapshot":"baseline", "network_policy":policy});
             assert!(
                 serde_json::from_value::<RestoreOptions>(value).is_err(),
                 "{field}"

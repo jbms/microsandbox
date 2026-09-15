@@ -1,5 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { napi } from "../../dist/internal/napi.js";
+import { Sandbox } from "../../dist/sandbox.js";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe("native Sandbox lifecycle contract", () => {
   it("exports the live lifecycle methods used by the TS wrapper", () => {
@@ -35,6 +40,35 @@ describe("native Sandbox lifecycle contract", () => {
     const proto = napi.SandboxBuilder.prototype as Record<string, unknown>;
     expect(typeof proto.cmd).toBe("function");
     expect(typeof proto.connectOrCreate).toBe("function");
+    expect(proto.fromSnapshot).toBeUndefined();
+    expect(proto.fromSnapshotRef).toBeUndefined();
+  });
+
+  it("accepts strings and typed snapshot references through dedicated restore", () => {
+    expect(() => Sandbox.restore("nightly").name("from-string")).not.toThrow();
+    expect(() => Sandbox.restore({ reference: "snapshot-id", referenceKind: "id" }).name("from-id")).not.toThrow();
+    expect(() => Sandbox.restore({ reference: "snapshot-path", referenceKind: "path" }).name("from-path")).not.toThrow();
+    expect(() => new napi.RestoreBuilder("snapshot", "invalid" as never)).toThrow("unknown snapshot reference kind");
+  });
+
+  it("exposes narrow destination controls on the dedicated restore builder", () => {
+    const builder = new napi.RestoreBuilder("snapshot").name("destination");
+    expect(builder.cpus(2).memory(512).maxConnections(0).disableNetwork()
+      .security("default").maxDuration(0).idleTimeout(0)).toBe(builder);
+    expect(() => builder.networkPolicyJson(JSON.stringify({
+      default_egress: "deny", default_ingress: "deny", rules: [],
+    }))).not.toThrow();
+    expect(() => builder.networkPolicyJson(JSON.stringify({ tls: {} })))
+      .toThrow("restore network policy accepts only default actions and rules");
+    expect(() => builder.cpus(256)).toThrow("cpus out of u8 range");
+    expect(() => builder.security("invalid" as never)).toThrow("invalid security profile");
+    for (const value of [-1, NaN, Infinity]) {
+      expect(() => builder.maxDuration(value)).toThrow("restore duration must be finite");
+      expect(() => builder.idleTimeout(value)).toThrow("restore duration must be finite");
+    }
+    for (const method of ["image", "network", "cmd", "entrypoint", "replace", "create"]) {
+      expect((builder as unknown as Record<string, unknown>)[method], method).toBeUndefined();
+    }
   });
 
   it("exports the handle health methods used by the TS wrapper", () => {
@@ -97,5 +131,10 @@ describe("native snapshot contract", () => {
     await expect(napi.Snapshot.loadMany([])).rejects.toThrow(
       "snapshot load requires at least one archive",
     );
+  });
+  it("exports instance archive methods", () => {
+    expect(typeof napi.Snapshot.prototype.saveTo).toBe("function");
+    expect(typeof napi.Snapshot.prototype.copyTo).toBe("function");
+    expect(typeof napi.SnapshotHandle.prototype.saveTo).toBe("function");
   });
 });

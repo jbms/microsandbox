@@ -25,6 +25,7 @@ from microsandbox.types import (
     MountConfig,
     NamedVolumeMode,
     Network,
+    NetworkPolicy,
     PatchConfig,
     PortBinding,
     PullEventType,
@@ -97,9 +98,17 @@ class Sandbox:
 
     @staticmethod
     async def restore(
-        snapshot: str | os.PathLike[str],
+        snapshot: Snapshot | SnapshotHandle | str | os.PathLike[str],
         *,
         name: str,
+        cpus: int | None = None,
+        memory: int | None = None,
+        network_policy: NetworkPolicy | None = None,
+        max_connections: int | None = None,
+        disable_network: bool = False,
+        security: SecurityProfile | None = None,
+        max_duration: float | None = None,
+        idle_timeout: float | None = None,
         forked: bool = False,
         disk_only: bool = False,
         snapshot_base: str | None = None,
@@ -114,9 +123,17 @@ class Sandbox:
     ) -> Sandbox: ...
     @staticmethod
     def restore_with_progress(
-        snapshot: str | os.PathLike[str],
+        snapshot: Snapshot | SnapshotHandle | str | os.PathLike[str],
         *,
         name: str,
+        cpus: int | None = None,
+        memory: int | None = None,
+        network_policy: NetworkPolicy | None = None,
+        max_connections: int | None = None,
+        disable_network: bool = False,
+        security: SecurityProfile | None = None,
+        max_duration: float | None = None,
+        idle_timeout: float | None = None,
         forked: bool = False,
         disk_only: bool = False,
         snapshot_base: str | None = None,
@@ -1000,8 +1017,6 @@ class Snapshot:
     @staticmethod
     async def list() -> list[SnapshotHandle]: ...
     @staticmethod
-    async def list_dir(dir: str | os.PathLike[str]) -> list[Snapshot]: ...
-    @staticmethod
     async def remove(path_or_name: str, *, force: bool = False) -> None: ...
     @staticmethod
     async def reindex(dir: str | os.PathLike[str] | None = None) -> int: ...
@@ -1041,7 +1056,13 @@ class Snapshot:
     @property
     def id(self) -> str: ...
     @property
-    def path(self) -> str: ...
+    def reference(self) -> str: ...
+    @property
+    def path(self) -> str:
+        """Deprecated: use reference. Raises UnsupportedError for remote snapshots."""
+        ...
+    @property
+    def reference_kind(self) -> Literal["id", "path"]: ...
     @property
     def digest(self) -> str: ...
     @property
@@ -1070,6 +1091,19 @@ class Snapshot:
     def labels(self) -> dict[str, str]: ...
     @property
     def source_sandbox(self) -> str | None: ...
+    @staticmethod
+    async def list_dir(dir: str | os.PathLike[str]) -> list[Snapshot]: ...
+    async def save_to(
+        self,
+        out: str | os.PathLike[str],
+        *,
+        with_parents: bool = False,
+        with_image: bool = False,
+        plain_tar: bool = False,
+        since: str | None = None,
+        last_layers: int | None = None,
+    ) -> None: ...
+    def copy_to(self, output_archive_path: str | os.PathLike[str]) -> SnapshotCopyBuilder: ...
     async def verify(self) -> dict[str, Any]: ...
 
 class SnapshotArchive:
@@ -1079,6 +1113,11 @@ class SnapshotArchive:
     def descriptor_digest(self) -> str: ...
     @property
     def path(self) -> str: ...
+
+class SnapshotCopyBuilder:
+    def labels(self, labels: dict[str, str]) -> SnapshotCopyBuilder: ...
+    def record_integrity(self, enabled: bool) -> SnapshotCopyBuilder: ...
+    async def save(self) -> None: ...
 
 class SnapshotHandle:
     @property
@@ -1118,9 +1157,25 @@ class SnapshotHandle:
     @property
     def created_at(self) -> float: ...
     @property
-    def path(self) -> str: ...
+    def reference(self) -> str: ...
+    @property
+    def path(self) -> str:
+        """Deprecated: use reference. Raises UnsupportedError for remote snapshots."""
+        ...
+    @property
+    def reference_kind(self) -> Literal["id", "path"]: ...
     async def open(self) -> Snapshot: ...
     async def remove(self, *, force: bool = False) -> None: ...
+    async def save_to(
+        self,
+        out: str | os.PathLike[str],
+        *,
+        with_parents: bool = False,
+        with_image: bool = False,
+        plain_tar: bool = False,
+        since: str | None = None,
+        last_layers: int | None = None,
+    ) -> None: ...
 
 class PullSession:
     def cancel(self) -> None: ...

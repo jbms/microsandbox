@@ -21,9 +21,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let h = Sandbox::get("snapshot-baseline").await?;
     let snap = h.snapshot("snapshot-baseline-state").await?;
     println!("created snapshot: {}", snap.digest());
-    println!("                  {}", snap.path().display());
+    println!("        reference: {}", snap.reference().value());
 
-    let fork = Sandbox::restore(snap.path().to_string_lossy())
+    let fork = Sandbox::restore_ref(snap.reference())
         .name("snapshot-fork")
         .restore()
         .await?;
@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Sandbox::remove("snapshot-baseline").await?;
     Sandbox::remove("snapshot-fork").await?;
-    microsandbox::Snapshot::remove("snapshot-baseline:snapshot-baseline-state", false).await?;
+    microsandbox::Snapshot::remove_ref(snap.reference(), false).await?;
 
     Ok(())
 }

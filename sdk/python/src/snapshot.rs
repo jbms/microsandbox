@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use pyo3::prelude::*;
@@ -18,7 +18,7 @@ use crate::helpers::str_enum_member;
 // Types
 //--------------------------------------------------------------------------------------------------
 
-/// A snapshot artifact on disk.
+/// A backend-neutral disk snapshot.
 #[pyclass(name = "Snapshot")]
 pub struct PySnapshot {
     inner: RustSnapshot,
@@ -30,7 +30,16 @@ pub struct PySnapshotArchive {
     inner: RustSnapshotArchive,
 }
 
-/// Lightweight snapshot handle from the local index.
+/// Builder for copying a snapshot archive with replacement metadata.
+#[pyclass(name = "SnapshotCopyBuilder")]
+pub struct PySnapshotCopyBuilder {
+    snapshot: RustSnapshot,
+    output_archive_path: PathBuf,
+    labels: BTreeMap<String, String>,
+    record_integrity: bool,
+}
+
+/// Lightweight snapshot handle returned by the active backend.
 #[pyclass(name = "SnapshotHandle")]
 pub struct PySnapshotHandle {
     inner: RustSnapshotHandle,
@@ -47,6 +56,8 @@ impl PySnapshot {
     /// The artifact is installed in a snapshot group under the default snapshots
     /// directory or `dest_dir`. Omitted member names are generated; the group
     /// defaults to the source sandbox's name.
+    /// The local backend uses its default artifact store; the cloud backend
+    /// uses managed storage unless `dest_dir=` selects the host volume.
     // PyO3 kwargs map one-to-one onto function parameters; the count is the contract.
     #[allow(clippy::too_many_arguments)]
     #[staticmethod]
@@ -163,7 +174,7 @@ impl PySnapshot {
         })
     }
 
-    /// Look up an indexed snapshot by digest, name, or path.
+    /// Look up a snapshot using the active backend's public identifier.
     #[staticmethod]
     fn get<'py>(py: Python<'py>, name_or_digest: String) -> PyResult<Bound<'py, PyAny>> {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -174,7 +185,7 @@ impl PySnapshot {
         })
     }
 
-    /// List indexed snapshots from the local DB cache.
+    /// List snapshots visible through the active backend.
     #[staticmethod]
     fn list<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -184,20 +195,6 @@ impl PySnapshot {
                 .map(PySnapshotHandle::from_rust)
                 .collect();
             Ok(py_handles)
-        })
-    }
-
-    /// Walk `dir` and parse each subdirectory's `snapshot.json`. Does
-    /// not touch the local index — useful for inspecting external
-    /// snapshot collections (e.g. a mounted volume of artifacts that
-    /// were never imported).
-    #[staticmethod]
-    fn list_dir<'py>(py: Python<'py>, dir: PathBuf) -> PyResult<Bound<'py, PyAny>> {
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let snapshots = RustSnapshot::list_dir(&dir).await.map_err(to_py_err)?;
-            let py_snaps: Vec<PySnapshot> =
-                snapshots.into_iter().map(PySnapshot::from_rust).collect();
-            Ok(py_snaps)
         })
     }
 
@@ -217,23 +214,6 @@ impl PySnapshot {
                 .await
                 .map_err(to_py_err)?;
             Ok(())
-        })
-    }
-
-    /// Walk the snapshots directory and rebuild the local index.
-    /// Defaults to the configured snapshots directory.
-    #[staticmethod]
-    #[pyo3(signature = (dir = None))]
-    fn reindex<'py>(py: Python<'py>, dir: Option<PathBuf>) -> PyResult<Bound<'py, PyAny>> {
-        let dir = dir.unwrap_or_else(|| {
-            microsandbox::backend::default_backend()
-                .as_local()
-                .map(|l| l.snapshots_dir())
-                .unwrap_or_else(|| std::path::PathBuf::from("."))
-        });
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let n = RustSnapshot::reindex(&dir).await.map_err(to_py_err)?;
-            Ok(n)
         })
     }
 
@@ -356,10 +336,25 @@ impl PySnapshot {
     // Instance accessors
     //----------------------------------------------------------------------------------------------
 
-    /// Path to the artifact directory.
+    /// Deprecated: use `reference`. Raises UnsupportedError for remote snapshots.
     #[getter]
-    fn path(&self) -> String {
-        self.inner.path().display().to_string()
+    fn path(&self) -> PyResult<String> {
+        self.inner
+            .path()
+            .map(|path| path.to_string_lossy().into_owned())
+            .map_err(to_py_err)
+    }
+
+    /// Stable reference accepted by `Sandbox.restore(...)`.
+    #[getter]
+    fn reference(&self) -> String {
+        self.inner.reference().value().to_owned()
+    }
+
+    /// How the active backend resolves `reference`.
+    #[getter]
+    fn reference_kind(&self) -> &'static str {
+        self.inner.reference().kind()
     }
 
     /// Outcome of the group head update performed by this capture.
@@ -383,7 +378,7 @@ impl PySnapshot {
         self.inner.digest()
     }
 
-    /// Apparent size of the captured upper layer in bytes.
+    /// Backend-reported stored payload size in bytes.
     #[getter]
     fn size_bytes(&self) -> Option<u64> {
         self.inner.size_bytes()
@@ -491,14 +486,91 @@ impl PySnapshot {
         self.inner.manifest().capture.source_lineage.as_deref()
     }
 
-    /// Verify recorded content integrity.
-    ///
-    /// Returns `kind="not_recorded"` when no integrity was requested, or
-    /// `kind="verified"` with the matching algorithm and digest.
-    fn verify<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let snap = self.inner.clone();
+    /// Walk a backend-visible directory and parse each snapshot artifact.
+    /// Raises `UnsupportedError` when artifact-file access is unavailable.
+    #[staticmethod]
+    fn list_dir<'py>(py: Python<'py>, dir: PathBuf) -> PyResult<Bound<'py, PyAny>> {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let report = snap.verify().await.map_err(to_py_err)?;
+            let snapshots = RustSnapshot::list_dir(&dir).await.map_err(to_py_err)?;
+            Ok(snapshots
+                .into_iter()
+                .map(PySnapshot::from_rust)
+                .collect::<Vec<_>>())
+        })
+    }
+
+    /// Rebuild the backend snapshot index from artifacts in `dir`.
+    /// Raises `UnsupportedError` when the backend has no rebuildable index.
+    #[staticmethod]
+    #[pyo3(signature = (dir = None))]
+    fn reindex<'py>(py: Python<'py>, dir: Option<PathBuf>) -> PyResult<Bound<'py, PyAny>> {
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            match dir {
+                Some(dir) => RustSnapshot::reindex(dir).await,
+                None => RustSnapshot::reindex_default().await,
+            }
+            .map_err(to_py_err)
+        })
+    }
+
+    /// Bundle this snapshot into a `.tar.zst` archive.
+    /// Raises `UnsupportedError` when artifact archives are unavailable.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        out,
+        *,
+        with_parents = false,
+        with_image = false,
+        plain_tar = false,
+        since = None,
+        last_layers = None,
+    ))]
+    fn save_to<'py>(
+        &self,
+        py: Python<'py>,
+        out: PathBuf,
+        with_parents: bool,
+        with_image: bool,
+        plain_tar: bool,
+        since: Option<String>,
+        last_layers: Option<usize>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let snapshot = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            snapshot
+                .save_to(
+                    &out,
+                    RustSaveOpts {
+                        with_parents,
+                        with_image,
+                        plain_tar,
+                        since,
+                        last_layers,
+                    },
+                )
+                .await
+                .map_err(to_py_err)
+        })
+    }
+
+    /// Configure a new archive containing this snapshot's disk data and
+    /// replacement labels and integrity metadata.
+    /// Raises `UnsupportedError` when artifact archives are unavailable.
+    fn copy_to(&self, output_archive_path: PathBuf) -> PySnapshotCopyBuilder {
+        PySnapshotCopyBuilder {
+            snapshot: self.inner.clone(),
+            output_archive_path,
+            labels: BTreeMap::new(),
+            record_integrity: false,
+        }
+    }
+
+    /// Verify this snapshot's recorded payload integrity.
+    /// Raises `UnsupportedError` when payload verification is unavailable.
+    fn verify<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let snapshot = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let report = snapshot.verify().await.map_err(to_py_err)?;
             Python::with_gil(|py| -> PyResult<PyObject> {
                 let upper = PyDict::new(py);
                 match report.upper {
@@ -551,9 +623,54 @@ impl PySnapshotArchive {
     }
 }
 
+//--------------------------------------------------------------------------------------------------
+// Methods: SnapshotCopyBuilder
+//--------------------------------------------------------------------------------------------------
+
+#[pymethods]
+impl PySnapshotCopyBuilder {
+    /// Replace the copied snapshot's labels.
+    fn labels<'py>(
+        mut slf: PyRefMut<'py, Self>,
+        labels: HashMap<String, String>,
+    ) -> PyRefMut<'py, Self> {
+        slf.labels = labels.into_iter().collect();
+        slf
+    }
+
+    /// Choose whether to calculate and record disk integrity in the copy.
+    fn record_integrity<'py>(mut slf: PyRefMut<'py, Self>, enabled: bool) -> PyRefMut<'py, Self> {
+        slf.record_integrity = enabled;
+        slf
+    }
+
+    /// Write the configured snapshot archive.
+    /// Raises `UnsupportedError` when artifact archives are unavailable.
+    fn save<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let snapshot = self.snapshot.clone();
+        let output_archive_path = self.output_archive_path.clone();
+        let labels = self.labels.clone();
+        let record_integrity = self.record_integrity;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            snapshot
+                .copy_to(output_archive_path)
+                .labels(labels)
+                .record_integrity(record_integrity)
+                .save()
+                .await
+                .map_err(to_py_err)?;
+            Ok(())
+        })
+    }
+}
+
 impl PySnapshot {
     pub fn from_rust(inner: RustSnapshot) -> Self {
         Self { inner }
+    }
+
+    pub(crate) fn rust_reference(&self) -> microsandbox::SnapshotReference {
+        self.inner.reference()
     }
 }
 
@@ -661,9 +778,24 @@ impl PySnapshotHandle {
         self.inner.created_at().and_utc().timestamp_millis() as f64
     }
 
+    /// Deprecated: use `reference`. Raises UnsupportedError for remote snapshots.
     #[getter]
-    fn path(&self) -> String {
-        self.inner.path().display().to_string()
+    fn path(&self) -> PyResult<String> {
+        self.inner
+            .path()
+            .map(|path| path.to_string_lossy().into_owned())
+            .map_err(to_py_err)
+    }
+
+    /// Stable reference accepted by `Sandbox.restore(...)`.
+    #[getter]
+    fn reference(&self) -> String {
+        self.inner.reference().value().to_owned()
+    }
+
+    #[getter]
+    fn reference_kind(&self) -> &'static str {
+        self.inner.reference().kind()
     }
 
     /// Open and metadata-validate the underlying artifact.
@@ -684,11 +816,55 @@ impl PySnapshotHandle {
             Ok(())
         })
     }
+
+    /// Bundle this snapshot into a `.tar.zst` archive.
+    /// Raises `UnsupportedError` when artifact archives are unavailable.
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        out,
+        *,
+        with_parents = false,
+        with_image = false,
+        plain_tar = false,
+        since = None,
+        last_layers = None,
+    ))]
+    fn save_to<'py>(
+        &self,
+        py: Python<'py>,
+        out: PathBuf,
+        with_parents: bool,
+        with_image: bool,
+        plain_tar: bool,
+        since: Option<String>,
+        last_layers: Option<usize>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let handle = self.inner.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            handle
+                .save_to(
+                    &out,
+                    RustSaveOpts {
+                        with_parents,
+                        with_image,
+                        plain_tar,
+                        since,
+                        last_layers,
+                    },
+                )
+                .await
+                .map_err(to_py_err)
+        })
+    }
 }
 
 impl PySnapshotHandle {
     pub fn from_rust(inner: RustSnapshotHandle) -> Self {
         Self { inner }
+    }
+
+    pub(crate) fn rust_reference(&self) -> microsandbox::SnapshotReference {
+        self.inner.reference()
     }
 }
 

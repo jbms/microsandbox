@@ -40,6 +40,7 @@ fn error_type_str(err: &MicrosandboxError) -> &'static str {
         MicrosandboxError::SandboxReplaced { .. } => "SandboxReplaced",
         MicrosandboxError::SandboxStillRunning(_) => "SandboxStillRunning",
         MicrosandboxError::SandboxNotRunning(_) => "SandboxNotRunning",
+        MicrosandboxError::SandboxStopTimedOut { .. } => "SandboxStopTimedOut",
         MicrosandboxError::Runtime(_) => "Runtime",
         MicrosandboxError::BootStart { .. } => "BootStart",
         MicrosandboxError::Json(_) => "Json",
