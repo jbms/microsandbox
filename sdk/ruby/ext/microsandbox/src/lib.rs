@@ -2104,7 +2104,13 @@ fn snapshot_save(ruby: &Ruby, args: &[Value]) -> Result<(), Error> {
     reject_unknown_keywords(
         ruby,
         parsed.keywords,
-        &["with_parents", "with_image", "plain_tar", "since", "last_layers"],
+        &[
+            "with_parents",
+            "with_image",
+            "plain_tar",
+            "since",
+            "last_layers",
+        ],
     )?;
     let reference = parsed.required.0;
     let out = PathBuf::from(parsed.required.1);

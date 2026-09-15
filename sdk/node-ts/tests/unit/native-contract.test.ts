@@ -62,9 +62,13 @@ describe("native Sandbox lifecycle contract", () => {
       .toThrow("restore network policy accepts only default actions and rules");
     expect(() => builder.cpus(256)).toThrow("cpus out of u8 range");
     expect(() => builder.security("invalid" as never)).toThrow("invalid security profile");
-    for (const value of [-1, NaN, Infinity]) {
+    for (const value of [-1, NaN, Infinity, -Infinity, 2 ** 64]) {
       expect(() => builder.maxDuration(value)).toThrow("restore duration must be finite");
       expect(() => builder.idleTimeout(value)).toThrow("restore duration must be finite");
+    }
+    // Rejected values must not consume the builder or change valid limit semantics.
+    for (const value of [0, -0, 0.5, 1.5, Number.MIN_VALUE]) {
+      expect(builder.maxDuration(value).idleTimeout(value)).toBe(builder);
     }
     for (const method of ["image", "network", "cmd", "entrypoint", "replace", "create"]) {
       expect((builder as unknown as Record<string, unknown>)[method], method).toBeUndefined();

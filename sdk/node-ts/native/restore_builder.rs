@@ -135,7 +135,7 @@ impl JsRestoreBuilder {
     /// Apply the destination host's maximum runtime in seconds; zero expires immediately.
     #[napi(js_name = "maxDuration")]
     pub fn max_duration(&mut self, secs: f64) -> Result<&Self> {
-        let seconds = duration_seconds(secs)?;
+        let seconds = duration_seconds(secs).map_err(napi::Error::from_reason)?;
         self.inner = Some(self.take_inner()?.max_duration(seconds));
         Ok(self)
     }
@@ -143,7 +143,7 @@ impl JsRestoreBuilder {
     /// Apply the destination host's idle timeout in seconds; zero expires immediately.
     #[napi(js_name = "idleTimeout")]
     pub fn idle_timeout(&mut self, secs: f64) -> Result<&Self> {
-        let seconds = duration_seconds(secs)?;
+        let seconds = duration_seconds(secs).map_err(napi::Error::from_reason)?;
         self.inner = Some(self.take_inner()?.idle_timeout(seconds));
         Ok(self)
     }
@@ -363,11 +363,11 @@ impl JsRestoreBuilder {
 //--------------------------------------------------------------------------------------------------
 
 /// Retain explicit zero, but never truncate a positive limit into immediate expiry.
-fn duration_seconds(seconds: f64) -> Result<u64> {
+fn duration_seconds(seconds: f64) -> std::result::Result<u64, &'static str> {
+    // Keep validation independent of Node's error lifecycle so standalone Rust tests
+    // do not need N-API symbols. Only the public binding creates JavaScript errors.
     if !seconds.is_finite() || seconds < 0.0 || seconds >= u64::MAX as f64 {
-        return Err(napi::Error::from_reason(
-            "restore duration must be finite, non-negative, and fit in seconds",
-        ));
+        return Err("restore duration must be finite, non-negative, and fit in seconds");
     }
     Ok(seconds.ceil() as u64)
 }
@@ -383,10 +383,21 @@ mod tests {
     #[test]
     fn restore_duration_preserves_zero_and_rounds_positive_limits_up() {
         assert_eq!(duration_seconds(0.0).unwrap(), 0);
+        assert_eq!(duration_seconds(-0.0).unwrap(), 0);
         assert_eq!(duration_seconds(0.5).unwrap(), 1);
         assert_eq!(duration_seconds(1.5).unwrap(), 2);
-        for value in [-1.0, f64::NAN, f64::INFINITY, u64::MAX as f64] {
-            assert!(duration_seconds(value).is_err());
+        assert_eq!(duration_seconds(f64::MIN_POSITIVE).unwrap(), 1);
+        for value in [
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            u64::MAX as f64,
+        ] {
+            assert_eq!(
+                duration_seconds(value).unwrap_err(),
+                "restore duration must be finite, non-negative, and fit in seconds",
+            );
         }
     }
 }
