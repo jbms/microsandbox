@@ -8,6 +8,7 @@ from typing import Any, Literal
 
 from microsandbox.types import (
     BackendKind,
+    DiskCompactionResult,
     DiskImageFormat,
     ExecEventType,
     ExecOptions,
@@ -354,8 +355,13 @@ class Sandbox:
     async def ping(self) -> SandboxPingResult: ...
     async def touch(self) -> SandboxTouchResult: ...
     async def compact(
-        self, *, layers: int | None = None, dry_run: bool = False
-    ) -> dict[str, int | bool]: ...
+        self,
+        *,
+        layers: int | None = None,
+        dry_run: bool = False,
+        disk: str | None = None,
+        root_disk_only: bool = False,
+    ) -> DiskCompactionResult: ...
     async def modify(
         self,
         *,
@@ -464,8 +470,13 @@ class SandboxHandle:
     async def ping(self) -> SandboxPingResult: ...
     async def touch(self) -> SandboxTouchResult: ...
     async def compact(
-        self, *, layers: int | None = None, dry_run: bool = False
-    ) -> dict[str, int | bool]: ...
+        self,
+        *,
+        layers: int | None = None,
+        dry_run: bool = False,
+        disk: str | None = None,
+        root_disk_only: bool = False,
+    ) -> DiskCompactionResult: ...
     async def modify(
         self,
         *,
@@ -738,6 +749,21 @@ class Volume:
         name: str,
         *,
         mode: NamedVolumeMode | None = None,
+        kind: VolumeKind | None = None,
+        size_mib: int | None = None,
+        quota_mib: int | None = None,
+        readonly: bool = False,
+        noexec: bool = False,
+        nosuid: bool = False,
+        nodev: bool = False,
+        stat_virtualization: StatVirtualization | None = None,
+        host_permissions: HostPermissions | None = None,
+        uid: int | None = None,
+        gid: int | None = None,
+    ) -> MountConfig: ...
+    @staticmethod
+    def owned(
+        *,
         kind: VolumeKind | None = None,
         size_mib: int | None = None,
         quota_mib: int | None = None,

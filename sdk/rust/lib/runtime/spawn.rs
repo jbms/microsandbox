@@ -412,7 +412,9 @@ pub async fn spawn_sandbox(
     // one-entry filesystem instead of exporting the source's parent directory.
     let file_mounts = resolve_file_mounts(config)?;
     let named_volumes = resolve_named_volumes(local, config).await?;
-    let disk_locks = lock_disk_mounts(config, &named_volumes)?;
+    let owned_root = local.sandboxes_dir().join(&config.spec.name);
+    super::owned_volumes::validate(&owned_root, &config.spec.mounts)?;
+    let disk_locks = lock_disk_mounts(config, &named_volumes, &owned_root)?;
     let metrics_reservation = if config.effective_metrics_interval().is_some() {
         reserve_metrics_slot(local, config, sandbox_id)
     } else {
@@ -602,6 +604,13 @@ pub async fn spawn_sandbox(
     // stdin — the VMM's implicit console auto-detects terminals and sets raw
     // mode, which corrupts the parent's terminal output (\n without \r).
     cmd.stdin(Stdio::null());
+    #[cfg(windows)]
+    if !disk_locks.is_empty() {
+        // A private, startup-only pipe is not a terminal. Old runtimes reject the flag rather
+        // than booting without adopting ownership. No public agent/control socket is added.
+        cmd.arg("--disk-locks-stdin");
+        cmd.stdin(Stdio::piped());
+    }
 
     #[cfg(unix)]
     {
@@ -610,6 +619,12 @@ pub async fn spawn_sandbox(
             .map(|pipe| pipe.read_fd.as_raw_fd());
         let startup_write_fd = startup_pipe.as_ref().map(|pipe| pipe.write_fd.as_raw_fd());
         let lifecycle_lock_fd = lifecycle_guard.as_raw_fd();
+        // Keep every parent descriptor close-on-exec: other SDK launches may run concurrently.
+        // Only this child's pre-exec callback admits its own disk lock descriptors.
+        let disk_lock_fds = disk_locks
+            .iter()
+            .map(AsRawFd::as_raw_fd)
+            .collect::<Vec<_>>();
         unsafe {
             cmd.pre_exec(move || {
                 if startup_write_fd.is_some() {
@@ -641,6 +656,7 @@ pub async fn spawn_sandbox(
                     move_reserved_source_fd(mapping, &mut next_spare_fd)?;
                 }
                 move_reserved_source_fd(&mut lifecycle_mapping, &mut next_spare_fd)?;
+                inherit_disk_lock_fds(&disk_lock_fds, &mut next_spare_fd)?;
 
                 dup_inherited_fd(config_mapping.src, config_mapping.dst)?;
                 if let Some(mapping) = parent_watch_mapping {
@@ -747,6 +763,27 @@ pub async fn spawn_sandbox(
             .terminate_failed_startup()
             .await;
         return Err(startup_error_with_cleanup(error, cleanup));
+    }
+
+    #[cfg(windows)]
+    {
+        let handoff = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            startup_process.handle_mut().handoff_disk_locks(),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(MicrosandboxError::Runtime(
+                "sandbox startup timeout during disk ownership handoff".into(),
+            ))
+        });
+        if let Err(error) = handoff {
+            let cleanup = startup_process
+                .handle_mut()
+                .terminate_failed_startup()
+                .await;
+            return Err(startup_error_with_cleanup(error, cleanup));
+        }
     }
 
     let startup_result = match tokio::time::timeout(
@@ -1295,14 +1332,38 @@ fn move_reserved_source_fd(
 
 #[cfg(unix)]
 fn inherited_fd_source_needs_spare(src: i32, dst: i32) -> bool {
-    src != dst
-        && matches!(
-            src,
-            microsandbox_runtime::vm::CONFIG_FD
-                | microsandbox_runtime::vm::PARENT_WATCH_FD
-                | microsandbox_runtime::vm::STARTUP_FD
-                | microsandbox_runtime::vm::LIFECYCLE_LOCK_FD
-        )
+    src != dst && is_reserved_inherited_fd(src)
+}
+
+#[cfg(unix)]
+fn is_reserved_inherited_fd(fd: i32) -> bool {
+    matches!(
+        fd,
+        microsandbox_runtime::vm::CONFIG_FD
+            | microsandbox_runtime::vm::PARENT_WATCH_FD
+            | microsandbox_runtime::vm::STARTUP_FD
+            | microsandbox_runtime::vm::LIFECYCLE_LOCK_FD
+    )
+}
+
+/// Admit only this VM's disk locks after fork, without changing the parent's descriptor flags.
+#[cfg(unix)]
+fn inherit_disk_lock_fds(fds: &[i32], next_spare_fd: &mut i32) -> std::io::Result<()> {
+    for &fd in fds {
+        // A disk lock can occupy any of the fixed configuration/handshake descriptors in a
+        // busy SDK process. Preserve its open-file description before those slots are replaced.
+        // F_DUPFD allocates an unused descriptor and clears CLOEXEC in the child only.
+        if is_reserved_inherited_fd(fd) {
+            let spare = unsafe { libc::fcntl(fd, libc::F_DUPFD, *next_spare_fd) };
+            if spare < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            *next_spare_fd = spare.saturating_add(1);
+        } else {
+            clear_cloexec(fd)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -1753,6 +1814,7 @@ fn validate_requested_named_volume_labels(
 fn lock_disk_mounts(
     config: &SandboxConfig,
     named_volumes: &HashMap<String, ResolvedNamedVolume>,
+    sandbox_dir: &Path,
 ) -> MicrosandboxResult<Vec<File>> {
     let mut locks = Vec::new();
     let mut requests = Vec::new();
@@ -1766,8 +1828,35 @@ fn lock_disk_mounts(
         });
     }
 
+    if let RootfsSource::Oci(oci) = &config.spec.image
+        && let Some(microsandbox_types::RootDisk::DiskImage { path, .. }) = &oci.root_disk
+    {
+        // This is an external writable upper, not the shared read-only OCI base. Admit it
+        // through the same exclusion and runtime-owned handoff as other writable disks.
+        requests.push(DiskLockRequest {
+            path: path.clone(),
+            readonly: false,
+            label: format!("OCI writable root disk {}", path.display()),
+            volume_name: None,
+        });
+    }
+
     for mount in &config.spec.mounts {
         match mount {
+            VolumeMount::Owned {
+                guest,
+                storage: microsandbox_types::OwnedVolumeStorage::Disk { .. },
+                ..
+            } => {
+                requests.push(DiskLockRequest {
+                    // Checkpoints rotate the head, and compaction can collect disk.raw.
+                    // Retain one stable, small lock for this sandbox-owned device instead.
+                    path: super::owned_volumes::disk_lock_path(sandbox_dir, guest)?,
+                    readonly: false,
+                    label: format!("owned disk volume {guest:?}"),
+                    volume_name: None,
+                });
+            }
             VolumeMount::DiskImage { host, options, .. } => {
                 requests.push(DiskLockRequest {
                     path: host.clone(),
@@ -1878,7 +1967,6 @@ fn lock_disk_image_unix(
         return Err(MicrosandboxError::InvalidConfig(message));
     }
 
-    clear_cloexec(file.as_raw_fd())?;
     Ok(file)
 }
 
@@ -1923,7 +2011,7 @@ fn lock_disk_image_windows(
 }
 
 #[cfg(windows)]
-fn windows_disk_lock_path(path: &Path) -> MicrosandboxResult<PathBuf> {
+pub(crate) fn windows_disk_lock_path(path: &Path) -> MicrosandboxResult<PathBuf> {
     let file_name = path.file_name().ok_or_else(|| {
         MicrosandboxError::InvalidConfig(format!(
             "disk image path has no file name: {}",
@@ -1945,13 +2033,13 @@ fn is_windows_lock_conflict(err: &std::io::Error) -> bool {
 }
 
 #[cfg(unix)]
-fn clear_cloexec(fd: i32) -> MicrosandboxResult<()> {
+fn clear_cloexec(fd: i32) -> std::io::Result<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     if flags < 0 {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(std::io::Error::last_os_error());
     }
     if unsafe { libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) } < 0 {
-        return Err(std::io::Error::last_os_error().into());
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
@@ -2298,6 +2386,30 @@ fn push_dir_mount_arg(
     quota_mib: Option<u32>,
 ) {
     let tag = guest_mount_tag(guest);
+    push_dir_mount_arg_with_tag(
+        mounts,
+        &tag,
+        host_display,
+        options,
+        stat_virtualization,
+        host_permissions,
+        follow_root_symlinks,
+        quota_mib,
+    );
+}
+
+/// Render a directory mount with the already-resolved device identity.
+#[allow(clippy::too_many_arguments)]
+fn push_dir_mount_arg_with_tag(
+    mounts: &mut Vec<String>,
+    tag: &str,
+    host_display: &impl std::fmt::Display,
+    options: MountOptions,
+    stat_virtualization: StatVirtualization,
+    host_permissions: HostPermissions,
+    follow_root_symlinks: bool,
+    quota_mib: Option<u32>,
+) {
     let mut arg = format!("{tag}:{host_display}");
     let mut opts = mount_option_tokens(options);
     append_policy_options(
@@ -2578,6 +2690,13 @@ fn machine_cli_args(
     }
 
     let mut launch = LaunchConfig {
+        owned_volumes: config
+            .spec
+            .mounts
+            .iter()
+            .filter(|mount| matches!(mount, VolumeMount::Owned { .. }))
+            .cloned()
+            .collect(),
         db_path: db_path.to_path_buf(),
         db_connect_timeout_secs,
         log_dir: log_dir.to_path_buf(),
@@ -2778,6 +2897,64 @@ fn machine_cli_args(
     // typed guest-side mount instructions for agentd.
     for mount in &config.spec.mounts {
         match mount {
+            VolumeMount::Owned {
+                guest,
+                storage,
+                options,
+                stat_virtualization,
+                host_permissions,
+            } => {
+                let path = super::owned_volumes::backing_path(
+                    &local.sandboxes_dir().join(&config.spec.name),
+                    guest,
+                    storage,
+                );
+                let id = microsandbox_types::owned_volume_mount_id(guest);
+                match storage {
+                    microsandbox_types::OwnedVolumeStorage::Directory { quota_mib } => {
+                        push_dir_mount_arg_with_tag(
+                            &mut launch.mounts,
+                            &id,
+                            &path.display(),
+                            *options,
+                            *stat_virtualization,
+                            *host_permissions,
+                            false,
+                            Some(
+                                quota_mib.unwrap_or(crate::sandbox::config::DEFAULT_BIND_QUOTA_MIB),
+                            ),
+                        );
+                        launch.bootstrap.dir_mounts.push(BootstrapDirMount {
+                            tag: id,
+                            guest_path: guest.clone(),
+                            flags: bootstrap_mount_flags(*options),
+                        });
+                    }
+                    microsandbox_types::OwnedVolumeStorage::Disk { .. } => {
+                        push_disk_mount_arg(
+                            &mut launch.disks,
+                            &id,
+                            &path.display(),
+                            &DiskImageFormat::Raw,
+                            *options,
+                            true,
+                        );
+                        // Must-understand provenance: named disks remain shared even though
+                        // they are also capture-eligible. Never infer lifetime from that bit.
+                        launch
+                            .disks
+                            .last_mut()
+                            .expect("owned disk was just appended")
+                            .push_str(":lifecycle-owned");
+                        launch.bootstrap.disk_mounts.push(BootstrapDiskMount {
+                            id,
+                            guest_path: guest.clone(),
+                            fstype: Some("ext4".into()),
+                            flags: bootstrap_mount_flags(*options),
+                        });
+                    }
+                }
+            }
             VolumeMount::Bind {
                 host,
                 guest,
@@ -3332,6 +3509,262 @@ mod tests {
             42,
             microsandbox_runtime::vm::CONFIG_FD,
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_disk_lock_handoff_retains_child_ownership_not_creator_handle() {
+        use std::os::fd::AsRawFd;
+
+        let disk = tempfile::NamedTempFile::new().unwrap();
+        let lock = super::lock_disk_image_unix(disk.path(), false, None).unwrap();
+        let fd = lock.as_raw_fd();
+        assert_ne!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        let mut command = unix_disk_lock_test_command();
+        unsafe {
+            command.pre_exec(move || {
+                let mut next_spare_fd = microsandbox_runtime::vm::LIFECYCLE_LOCK_FD + 1;
+                super::inherit_disk_lock_fds(&[fd], &mut next_spare_fd)
+            });
+        }
+        let child = command.spawn().unwrap();
+        assert_ne!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        assert_unix_disk_lock_child_handoff(child, vec![lock], &[disk.path()]).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_disk_lock_is_not_inherited_by_an_unrelated_child() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let disk = tempfile::NamedTempFile::new().unwrap();
+        let lock = super::lock_disk_image_unix(disk.path(), false, None).unwrap();
+        // No handoff callback: a concurrently spawned ordinary process must not keep this
+        // disk busy after the creator releases it, even while the unrelated child stays alive.
+        let mut child = unix_disk_lock_test_command().spawn().unwrap();
+        let mut reader = tokio::io::BufReader::new(child.stdout.take().unwrap());
+        let mut ready = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read_line(&mut ready),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(ready, "ready\n");
+        drop(lock);
+        // This particular child has execed, but another parallel test may still be in
+        // pre-exec with a transient copy. Keep our child alive while proving release.
+        let acquired = wait_for_unix_test_disk_release(disk.path()).await;
+        assert!(child.try_wait().unwrap().is_none());
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"done\n")
+            .await
+            .unwrap();
+        assert!(child.wait().await.unwrap().success());
+        drop(acquired);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_disk_lock_handoff_preserves_reserved_fds_and_launch_sources() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+
+        let disks = std::array::from_fn::<_, 4, _>(|_| tempfile::NamedTempFile::new().unwrap());
+        let locks = disks
+            .iter()
+            .map(|disk| super::lock_disk_image_unix(disk.path(), false, None).unwrap())
+            .collect::<Vec<_>>();
+        let mut sources = std::array::from_fn::<_, 4, _>(|_| tempfile::tempfile().unwrap());
+        for (index, source) in sources.iter_mut().enumerate() {
+            source.write_all(&[index as u8]).unwrap();
+        }
+        let disk_fds = std::array::from_fn::<_, 4, _>(|index| locks[index].as_raw_fd());
+        let source_fds = sources.each_ref().map(AsRawFd::as_raw_fd);
+        let mut command = unix_disk_lock_test_command();
+        unsafe {
+            command.pre_exec(move || {
+                let slots = [
+                    microsandbox_runtime::vm::CONFIG_FD,
+                    microsandbox_runtime::vm::PARENT_WATCH_FD,
+                    microsandbox_runtime::vm::STARTUP_FD,
+                    microsandbox_runtime::vm::LIFECYCLE_LOCK_FD,
+                ];
+                // Put all four lock descriptors on reserved slots in this child only. First
+                // preserve every source above them so the fixture itself cannot overwrite a
+                // later source when the test runner already has many open descriptors.
+                let mut saved_disks = [0; 4];
+                let mut saved_sources = [0; 4];
+                for (fds, saved) in [
+                    (&disk_fds, &mut saved_disks),
+                    (&source_fds, &mut saved_sources),
+                ] {
+                    for (fd, saved) in fds.iter().zip(saved.iter_mut()) {
+                        *saved = libc::fcntl(*fd, libc::F_DUPFD_CLOEXEC, 100);
+                        if *saved < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                }
+                for (source, slot) in saved_disks.iter().zip(slots) {
+                    if libc::dup2(*source, slot) < 0
+                        || libc::fcntl(slot, libc::F_SETFD, libc::FD_CLOEXEC) < 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                let mut next_spare_fd = microsandbox_runtime::vm::LIFECYCLE_LOCK_FD + 1;
+                super::inherit_disk_lock_fds(&slots, &mut next_spare_fd)?;
+                for (index, (source, slot)) in saved_sources.iter().zip(slots).enumerate() {
+                    super::dup_inherited_fd(*source, slot)?;
+                    let mut actual = 255_u8;
+                    if libc::pread(slot, (&mut actual as *mut u8).cast(), 1, 0) != 1
+                        || actual != index as u8
+                    {
+                        return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                    }
+                }
+                Ok(())
+            });
+        }
+        let child = command.spawn().unwrap();
+        let paths = disks.each_ref().map(|disk| disk.path());
+        assert_unix_disk_lock_child_handoff(child, locks, &paths).await;
+    }
+
+    #[cfg(unix)]
+    fn unix_disk_lock_test_command() -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .args(["-c", "printf 'ready\\n'; read -r reply"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        command
+    }
+
+    #[cfg(unix)]
+    async fn assert_unix_disk_lock_child_handoff(
+        mut child: tokio::process::Child,
+        locks: Vec<std::fs::File>,
+        disks: &[&Path],
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let mut reader = tokio::io::BufReader::new(child.stdout.take().unwrap());
+        let mut writer = child.stdin.take().unwrap();
+        let mut ready = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read_line(&mut ready),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(ready, "ready\n");
+        let mut handle = super::ProcessHandle::new(
+            child.id().unwrap(),
+            "disk-lock-handoff-test".into(),
+            child,
+            locks,
+            None,
+            None,
+        );
+        for disk in disks {
+            let error = super::lock_disk_image_unix(disk, false, None).unwrap_err();
+            assert!(error.to_string().contains("incompatible disk mode"));
+        }
+        writer.write_all(b"done\n").await.unwrap();
+        assert!(handle.wait().await.unwrap().success());
+        for disk in disks {
+            // Retain the ProcessHandle across this acquisition: waiting or stopping must not
+            // require the SDK caller to drop its original Sandbox object to release disks.
+            let _acquired = wait_for_unix_test_disk_release(disk).await;
+        }
+        assert!(handle.try_wait().unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_unix_test_disk_release(path: &Path) -> std::fs::File {
+        // Parallel tests can fork while our parent still owns these files. CLOEXEC only
+        // closes that unrelated child's copies when it execs, not when our child exits.
+        // Observe release rather than assuming waitpid fences every inherited reference.
+        // A genuinely leaked descriptor still fails this test within the bounded deadline.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match super::lock_disk_image_unix(path, false, None) {
+                    Ok(file) => return file,
+                    Err(error) => {
+                        assert!(
+                            error.to_string().contains("incompatible disk mode"),
+                            "unexpected disk-lock error: {error}"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("disk lock was not released after child exit")
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_disk_lock_release_waits_for_unrelated_pre_exec_reference() {
+        use std::io::{Read, Write};
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        use std::os::unix::process::CommandExt;
+
+        let disk = tempfile::NamedTempFile::new().unwrap();
+        let lock = super::lock_disk_image_unix(disk.path(), false, None).unwrap();
+        let (mut parent_gate, child_gate) = UnixStream::pair().unwrap();
+        for gate in [&parent_gate, &child_gate] {
+            gate.set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+        }
+        let parent_fd = parent_gate.as_raw_fd();
+        let child_fd = child_gate.as_raw_fd();
+        let mut command = std::process::Command::new("true");
+        unsafe {
+            command.pre_exec(move || {
+                // Only async-signal-safe operations between fork and exec. Close the child's
+                // copy of the parent endpoint so a failed assertion also releases this gate.
+                libc::close(parent_fd);
+                let mut byte = 1_u8;
+                if libc::write(child_fd, (&byte as *const u8).cast(), 1) != 1
+                    || libc::read(child_fd, (&mut byte as *mut u8).cast(), 1) != 1
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        // spawn waits for exec, so hold this unrelated process in another thread while
+        // the test closes its own lock and observes the inherited pre-exec reference.
+        let spawning = std::thread::spawn(move || command.spawn());
+        let mut ready = [0];
+        parent_gate.read_exact(&mut ready).unwrap();
+        drop(child_gate);
+        drop(lock);
+        assert!(super::lock_disk_image_unix(disk.path(), false, None).is_err());
+        let path = disk.path().to_owned();
+        let waiting = tokio::spawn(async move { wait_for_unix_test_disk_release(&path).await });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        parent_gate.write_all(&[1]).unwrap();
+        assert!(spawning.join().unwrap().unwrap().wait().unwrap().success());
+        let _acquired = waiting.await.unwrap();
     }
 
     #[cfg(unix)]
@@ -4549,7 +4982,13 @@ mod tests {
 
         let rendered = render_args(&config);
         assert!(rendered.contains(&"--rootfs-disk".to_string()));
-        assert!(rendered.iter().any(|arg| arg.ends_with("/test/rootfs.raw")));
+        // Compare path components, including native Windows separators.
+        let root_tail = Path::new("test").join("rootfs.raw");
+        assert!(
+            rendered
+                .iter()
+                .any(|arg| Path::new(arg).ends_with(&root_tail))
+        );
         assert!(rendered.contains(&"--rootfs-disk-format".to_string()));
         assert!(rendered.contains(&"raw".to_string()));
         assert!(
@@ -5363,8 +5802,208 @@ mod tests {
             ..Default::default()
         };
 
-        let err = super::lock_disk_mounts(&config, &HashMap::new()).unwrap_err();
+        let err =
+            super::lock_disk_mounts(&config, &HashMap::new(), Path::new("unused")).unwrap_err();
         assert!(err.to_string().contains("more than once per sandbox"));
+    }
+
+    fn oci_upper_lock_config(name: &str, path: PathBuf) -> SandboxConfig {
+        SandboxConfig {
+            spec: microsandbox_types::SandboxSpec {
+                name: name.into(),
+                image: RootfsSource::Oci(OciRootfsSource {
+                    reference: "alpine".into(),
+                    root_disk: Some(microsandbox_types::RootDisk::DiskImage {
+                        path,
+                        format: DiskImageFormat::Raw,
+                        fstype: Some("ext4".into()),
+                    }),
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn oci_upper_lock_excludes_concurrent_sandbox_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join("upper.ext4");
+        std::fs::write(&disk, b"disk").unwrap();
+        let gate = std::sync::Barrier::new(2);
+        let outcomes = std::thread::scope(|scope| {
+            let workers = ["first", "second"].map(|name| {
+                let config = oci_upper_lock_config(name, disk.clone());
+                let gate = &gate;
+                scope.spawn(move || {
+                    gate.wait();
+                    let locks =
+                        super::lock_disk_mounts(&config, &HashMap::new(), Path::new("unused"));
+                    // The winner must retain ownership until both contenders have tried.
+                    gate.wait();
+                    locks
+                        .map(|locks| locks.len())
+                        .map_err(|error| error.to_string())
+                })
+            });
+            workers.map(|worker| worker.join().unwrap())
+        });
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|result| matches!(result, Ok(1)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|result| result
+                    .as_ref()
+                    .is_err_and(|error| error.contains("incompatible disk mode")))
+                .count(),
+            1
+        );
+        let config = oci_upper_lock_config("third", disk);
+        assert_eq!(
+            super::lock_disk_mounts(&config, &HashMap::new(), Path::new("unused"))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn oci_upper_lock_rejects_duplicate_mount_and_releases_partial_acquisition() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join("upper.ext4");
+        std::fs::write(&disk, b"disk").unwrap();
+        let mut config = oci_upper_lock_config("duplicate", disk.clone());
+        config.spec.mounts.push(VolumeMount::DiskImage {
+            host: dir.path().join(".").join("upper.ext4"),
+            guest: "/data".into(),
+            format: DiskImageFormat::Raw,
+            fstype: None,
+            options: MountOptions {
+                readonly: true,
+                ..Default::default()
+            },
+        });
+        let error =
+            super::lock_disk_mounts(&config, &HashMap::new(), Path::new("unused")).unwrap_err();
+        assert!(error.to_string().contains("more than once per sandbox"));
+        // Failure after acquiring the upper must not leave it reserved for a failed launch.
+        config.spec.mounts.clear();
+        assert_eq!(
+            super::lock_disk_mounts(&config, &HashMap::new(), Path::new("unused"))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn oci_upper_lock_excludes_readonly_attachment_and_leaves_plain_oci_unlocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join("upper.ext4");
+        std::fs::write(&disk, b"disk").unwrap();
+        let owner = oci_upper_lock_config("owner", disk.clone());
+        let locks = super::lock_disk_mounts(&owner, &HashMap::new(), Path::new("unused")).unwrap();
+
+        let mut reader = oci_upper_lock_config("reader", disk.clone());
+        reader.spec.image = RootfsSource::Oci(OciRootfsSource {
+            reference: "alpine".into(),
+            root_disk: None,
+        });
+        // Shared OCI image layers do not require attachment locks. The explicit upper
+        // does: even a read-only mount in another VM must conflict with its writer.
+        assert!(
+            super::lock_disk_mounts(&reader, &HashMap::new(), Path::new("unused"))
+                .unwrap()
+                .is_empty()
+        );
+        reader.spec.mounts.push(VolumeMount::DiskImage {
+            host: disk,
+            guest: "/data".into(),
+            format: DiskImageFormat::Raw,
+            fstype: None,
+            options: MountOptions {
+                readonly: true,
+                ..Default::default()
+            },
+        });
+        let error =
+            super::lock_disk_mounts(&reader, &HashMap::new(), Path::new("unused")).unwrap_err();
+        assert!(error.to_string().contains("incompatible disk mode"));
+        drop(locks);
+        assert_eq!(
+            super::lock_disk_mounts(&reader, &HashMap::new(), Path::new("unused"))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn oci_upper_lock_excludes_canonical_path_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join("upper.ext4");
+        std::fs::write(&disk, b"disk").unwrap();
+        let owner = oci_upper_lock_config("owner", disk);
+        let _locks = super::lock_disk_mounts(&owner, &HashMap::new(), Path::new("unused")).unwrap();
+        let alias = oci_upper_lock_config("alias", dir.path().join(".").join("upper.ext4"));
+        let error =
+            super::lock_disk_mounts(&alias, &HashMap::new(), Path::new("unused")).unwrap_err();
+        assert!(error.to_string().contains("incompatible disk mode"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oci_upper_lock_excludes_symlink_and_hardlink_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join("upper.ext4");
+        std::fs::write(&disk, b"disk").unwrap();
+        let symlink = dir.path().join("symlink.ext4");
+        let hardlink = dir.path().join("hardlink.ext4");
+        std::os::unix::fs::symlink(&disk, &symlink).unwrap();
+        std::fs::hard_link(&disk, &hardlink).unwrap();
+        let owner = oci_upper_lock_config("owner", disk);
+        let _locks = super::lock_disk_mounts(&owner, &HashMap::new(), Path::new("unused")).unwrap();
+        for path in [symlink, hardlink] {
+            let config = oci_upper_lock_config("alias", path);
+            let error =
+                super::lock_disk_mounts(&config, &HashMap::new(), Path::new("unused")).unwrap_err();
+            assert!(error.to_string().contains("incompatible disk mode"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oci_upper_lock_handoff_releases_while_creator_handle_is_retained() {
+        use std::os::fd::AsRawFd;
+
+        let disk = tempfile::NamedTempFile::new().unwrap();
+        let config = oci_upper_lock_config("owner", disk.path().into());
+        let locks = super::lock_disk_mounts(&config, &HashMap::new(), Path::new("unused")).unwrap();
+        assert_eq!(locks.len(), 1);
+        let fd = locks[0].as_raw_fd();
+        assert_ne!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        let mut command = unix_disk_lock_test_command();
+        unsafe {
+            command.pre_exec(move || {
+                let mut next_spare_fd = microsandbox_runtime::vm::LIFECYCLE_LOCK_FD + 1;
+                super::inherit_disk_lock_fds(&[fd], &mut next_spare_fd)
+            });
+        }
+        let child = command.spawn().unwrap();
+        assert_ne!(
+            unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
+            0
+        );
+        assert_unix_disk_lock_child_handoff(child, locks, &[disk.path()]).await;
     }
 
     #[test]
@@ -5402,7 +6041,8 @@ mod tests {
         let mut named_volumes = HashMap::new();
         named_volumes.insert("data".to_string(), named_disk(disk));
 
-        let err = super::lock_disk_mounts(&config, &named_volumes).unwrap_err();
+        let err =
+            super::lock_disk_mounts(&config, &named_volumes, Path::new("unused")).unwrap_err();
         assert!(err.to_string().contains("more than once per sandbox"));
     }
 
@@ -5433,6 +6073,32 @@ mod tests {
         let a = super::guest_mount_tag("/data");
         let b = super::guest_mount_tag("/data");
         assert_eq!(a, b);
+    }
+
+    #[tokio::test]
+    async fn owned_disk_lock_survives_data_file_rotation() {
+        let temp = tempfile::tempdir().unwrap();
+        let sandbox = temp.path().join("worker");
+        let config = SandboxBuilder::new("worker")
+            .image("/tmp/rootfs")
+            .volume("/data", |mount| {
+                mount.owned_with(|owned| owned.disk().size(1_u32))
+            })
+            .build()
+            .await
+            .unwrap();
+        let directory = sandbox
+            .join("owned-volumes")
+            .join(microsandbox_types::owned_volume_mount_id("/data"));
+        std::fs::create_dir_all(&directory).unwrap();
+        let base = directory.join("disk.raw");
+        std::fs::write(&base, b"original base").unwrap();
+        let locks = super::lock_disk_mounts(&config, &HashMap::new(), &sandbox).unwrap();
+        // Compaction must be able to collect this data file without losing the device lock.
+        std::fs::remove_file(&base).unwrap();
+        assert!(super::lock_disk_mounts(&config, &HashMap::new(), &sandbox).is_err());
+        drop(locks);
+        assert!(super::lock_disk_mounts(&config, &HashMap::new(), &sandbox).is_ok());
     }
 
     #[tokio::test]

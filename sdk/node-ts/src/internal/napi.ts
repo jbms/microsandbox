@@ -310,7 +310,7 @@ export interface NapiSandbox {
   ping(): Promise<NapiSandboxPingResult>;
   touch(): Promise<NapiSandboxTouchResult>;
   modify(opts?: NapiSandboxModifyOptions): Promise<string>;
-  compact(layers?: number, dryRun?: boolean): Promise<string>;
+  compact(layers?: number, dryRun?: boolean, disk?: string, rootDiskOnly?: boolean): Promise<string>;
   attach(cmd: string, args?: string[]): Promise<number>;
   attachDefault(): Promise<number>;
   attachDefaultWithBuilder(builder: NapiAttachOptionsBuilder): Promise<number>;
@@ -349,7 +349,7 @@ export interface NapiSandboxHandle {
   ping(): Promise<NapiSandboxPingResult>;
   touch(): Promise<NapiSandboxTouchResult>;
   modify(opts?: NapiSandboxModifyOptions): Promise<string>;
-  compact(layers?: number, dryRun?: boolean): Promise<string>;
+  compact(layers?: number, dryRun?: boolean, disk?: string, rootDiskOnly?: boolean): Promise<string>;
   start(): Promise<NapiSandbox>;
   startDetached(): Promise<NapiSandbox>;
   connect(): Promise<NapiSandbox>;
@@ -1204,10 +1204,18 @@ export interface NapiBuiltNetworkPolicyDestination {
   readonly group?: string;
 }
 
+/** Storage allocated for one sandbox and removed with it. */
+export interface NapiOwnedVolumeOptions {
+  kind?: "dir" | "disk";
+  sizeMib?: number;
+  quotaMib?: number;
+}
+
 export interface NapiMountBuilder {
   captured(): this;
   bind(host: string): this;
   named(name: string): this;
+  owned(options?: NapiOwnedVolumeOptions): this;
   namedWith(
     name: string,
     mode?: "existing" | "create" | "ensure-exists",
@@ -1232,7 +1240,7 @@ export interface NapiMountBuilder {
 }
 
 export interface NapiVolumeMount {
-  readonly kind: "bind" | "named" | "tmpfs" | "disk";
+  readonly kind: "bind" | "named" | "owned" | "tmpfs" | "disk";
   readonly guest: string;
   readonly readonly: boolean;
   readonly noexec: boolean;
@@ -1242,6 +1250,7 @@ export interface NapiVolumeMount {
   readonly name?: string;
   readonly namedMode?: "existing" | "create" | "ensure-exists";
   readonly namedKind?: "dir" | "disk";
+  readonly ownedKind?: "dir" | "disk";
   readonly sizeMib?: number;
   readonly quotaMib?: number;
   readonly format?: string;

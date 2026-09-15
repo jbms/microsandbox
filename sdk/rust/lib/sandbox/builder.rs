@@ -1357,6 +1357,7 @@ impl SandboxBuilder {
                         "snapshot and checkpoint closure identities differ".into(),
                     ));
                 }
+                crate::snapshot::validate_checkpoint_owned_inventory(snap.manifest(), &opened)?;
                 if self.config.snapshot_restore_mode == SnapshotRestoreMode::Full {
                     if opened.architecture != std::env::consts::ARCH {
                         return Err(crate::MicrosandboxError::SnapshotIntegrity(
@@ -1430,6 +1431,10 @@ impl SandboxBuilder {
             )
             .collect();
         self.config.snapshot_root_virtual_size = Some(file_state.virtual_size);
+        let owned = snap.manifest().owned_volumes()?;
+        if !owned.is_empty() {
+            self.config.snapshot_owned_source = Some((snap.path().to_path_buf(), owned));
+        }
         Ok(())
     }
 

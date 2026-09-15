@@ -72,6 +72,10 @@ impl RuntimeControlExecutor {
         agent_sock: &Path,
         workload_control: std::sync::Arc<crate::runner::workload_control::WorkloadControl>,
         resident_paused: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        owned_directory_checkpoints: BTreeMap<
+            String,
+            microsandbox_filesystem::OwnedDirectoryCheckpoint,
+        >,
     ) -> Result<Self, String> {
         let runtime_boot_id = new_runtime_boot_id();
         persist_runtime_boot_id(runtime_dir, &runtime_boot_id)
@@ -83,6 +87,7 @@ impl RuntimeControlExecutor {
             runtime,
             agent_sock,
             workload_control,
+            owned_directory_checkpoints,
         )?;
         Ok(Self {
             pause_observation: std::sync::RwLock::new(ControlResponse {
@@ -328,28 +333,30 @@ impl RuntimeControlExecutor {
                     }
                 }
             }
-            ControlRequest::DiskCompact { layers, dry_run } => {
-                match state.checkpoint.compact(&self.vm, layers, dry_run) {
-                    Ok(result) => ControlResponse {
-                        ok: true,
-                        compaction: Some(result),
-                        ..Default::default()
-                    },
-                    Err(error) => {
-                        if error.keep_paused {
-                            state.lifecycle = RuntimeLifecycle::Quiesced;
-                        }
-                        control_error(
-                            if error.keep_paused {
-                                "compaction_recovery_required"
-                            } else {
-                                "compaction_failed"
-                            },
-                            error.to_string(),
-                        )
+            ControlRequest::DiskCompact {
+                target,
+                layers,
+                dry_run,
+            } => match state.checkpoint.compact(&self.vm, target, layers, dry_run) {
+                Ok(result) => ControlResponse {
+                    ok: true,
+                    compaction: Some(result),
+                    ..Default::default()
+                },
+                Err(error) => {
+                    if error.keep_paused {
+                        state.lifecycle = RuntimeLifecycle::Quiesced;
                     }
+                    control_error(
+                        if error.keep_paused {
+                            "compaction_recovery_required"
+                        } else {
+                            "compaction_failed"
+                        },
+                        error.to_string(),
+                    )
                 }
-            }
+            },
             ControlRequest::BranchCreate {
                 branch_id,
                 child_name,
@@ -503,6 +510,7 @@ impl RuntimeControlExecutor {
                     disk_checkpoint_create: true,
                     branch_create: cfg!(any(unix, windows)),
                     disk_compact: true,
+                    disk_compact_owned: true,
                     root_disk_grow: true,
                     pause_resume: self.vm.clock_sync_supported(),
                 }),
