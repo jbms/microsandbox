@@ -1077,7 +1077,9 @@ export declare class Sandbox {
   /** Warnings for unmapped external filesystems and accepted restore mismatches. */
   restoreWarnings(): Promise<Array<ExternalMountWarning>>
   /** Create an independent local CoW child without a durable full snapshot. */
-  branch(name: string): Promise<Sandbox>
+  branch(name: string, recordIntegrity?: boolean | undefined | null): Promise<Sandbox>
+  /** Capture once and return individual child startup outcomes. */
+  branchMany(names: Array<string>, recordIntegrity?: boolean | undefined | null): Promise<Array<JsBranchOutcome>>
   /** Explicit resident pause through host control. */
   pause(): Promise<void>
   /** Explicit resident resume through host control. */
@@ -1476,7 +1478,9 @@ export declare class SandboxHandle {
    */
   stop(): Promise<void>
   /** Create an independent local CoW child without a durable full snapshot. */
-  branch(name: string): Promise<Sandbox>
+  branch(name: string, recordIntegrity?: boolean | undefined | null): Promise<Sandbox>
+  /** Capture once and return individual child startup outcomes. */
+  branchMany(names: Array<string>, recordIntegrity?: boolean | undefined | null): Promise<Array<JsBranchOutcome>>
   /** Explicit resident pause through host control. */
   pause(): Promise<void>
   /** Explicit resident resume through host control. */
@@ -2080,6 +2084,13 @@ export interface JsBackendInfo {
   apiUrl?: string
   source: string
   profile?: string
+}
+
+/** One child result from a capture-once batch, in caller order. */
+export interface JsBranchOutcome {
+  name: string
+  sandbox?: Sandbox
+  error?: string
 }
 
 /** One page returned by `Sandbox.list` / `Sandbox.listWith`. */

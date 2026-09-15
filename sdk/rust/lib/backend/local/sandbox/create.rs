@@ -722,6 +722,10 @@ impl LocalBackend {
         };
         creation_cleanup.retain_process(local_state.handle.clone());
         returned_config.checkpoint_restore = None;
+        #[cfg(target_os = "linux")]
+        {
+            returned_config.branch_memory = None;
+        }
         returned_config.snapshot_upper_layers.clear();
         let mut sandbox = Sandbox::from_local(backend.clone(), local_state, returned_config);
         // This is the readiness publication boundary: create_sandbox_inner returns only after
@@ -1451,7 +1455,7 @@ impl LocalBackend {
     }
 
     /// Validate sandbox-name-derived runtime paths for this backend.
-    pub(super) fn validate_sandbox_name_for_runtime(&self, name: &str) -> MicrosandboxResult<()> {
+    pub(crate) fn validate_sandbox_name_for_runtime(&self, name: &str) -> MicrosandboxResult<()> {
         validate_sandbox_name(name)?;
         crate::runtime::resolve_sandbox_agent_socket_path_for(self, name).map(|_| ())
     }
@@ -2171,6 +2175,7 @@ mod tests {
         }
         let mut config = builder.build().await.unwrap();
         config.checkpoint_restore = Some(microsandbox_runtime::launch::CheckpointRestoreConfig {
+            memory_descriptor: false,
             network_gateway_mac: None,
             external_mount_policy: Default::default(),
             external_mounts: Vec::new(),
@@ -2278,10 +2283,27 @@ mod tests {
         }
 
         drop(runtime_owner);
-        local
-            .rollback_failed_startup(write_db, sandbox_id, &config.spec.name, &created)
-            .await
-            .unwrap();
+        // A concurrent test's fork may still hold a CLOEXEC copy until exec. A pending
+        // cleanup is correct in that interval; only retry that explicit ownership refusal.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match local
+                    .rollback_failed_startup(write_db, sandbox_id, &config.spec.name, &created)
+                    .await
+                {
+                    Ok(()) => break,
+                    Err(error) => {
+                        assert!(
+                            error.to_string().contains("startup cleanup pending"),
+                            "{error}"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("runtime ownership was not released before rollback");
         if with_created_volume {
             assert!(!volume_path.exists());
             assert!(
@@ -2550,6 +2572,7 @@ mod tests {
         let pools = open_test_pools(&temp.path().join("test.db")).await;
         let mut config = test_config_with_rootfs("pending", bind_rootfs(temp.path().to_path_buf()));
         config.checkpoint_restore = Some(microsandbox_runtime::launch::CheckpointRestoreConfig {
+            memory_descriptor: false,
             network_gateway_mac: None,
             external_mount_policy: Default::default(),
             external_mounts: Vec::new(),

@@ -297,13 +297,19 @@ fn owned_payloads(
             }
             OwnedVolumeData::Disk { generation } => {
                 for layer in &generation.layers {
+                    // This dependency identity predates optional capture hashes. A hashless
+                    // owned layer remains included in the archive; do not omit it as borrowed
+                    // data or consult a relative host path during manifest-only planning.
+                    let Some(integrity_root) = &layer.integrity_root else {
+                        continue;
+                    };
                     let relative =
                         Path::new("layers").join(format!("{}.{}", layer.layer_id, layer.format));
                     payloads.push((
                         RequiredOwnedPayload {
                             path: format!("{prefix}/{}", super::portable_archive_path(&relative)?),
                             identity: OwnedPayloadIdentity::Disk {
-                                integrity_root: layer.integrity_root.clone(),
+                                integrity_root: integrity_root.clone(),
                                 bytes: layer.virtual_size,
                             },
                         },

@@ -305,9 +305,12 @@ impl RuntimeOwnedDisk {
             captured.push(DiskLayerRef {
                 layer_id: layer.layer_id.clone(),
                 format: layer.format.clone(),
+                file_size: std::fs::metadata(&target)
+                    .map_err(|error| error.to_string())?
+                    .len(),
                 virtual_size: capacity,
                 predecessor: captured.last().map(|previous| previous.layer_id.clone()),
-                integrity_root: integrity,
+                integrity_root: Some(integrity),
             });
         }
         sync_directory(&directory)?;

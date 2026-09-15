@@ -40,8 +40,14 @@ pub(super) fn members(
             for layer in &generation.layers {
                 let name = format!("{}.{}", layer.layer_id, layer.format);
                 let path = source.join("layers").join(&name);
-                if microsandbox_image::checkpoint::sparse_file_integrity(&path)?.root
-                    != layer.integrity_root
+                if std::fs::metadata(&path)?.len() != layer.file_size {
+                    return Err(MicrosandboxError::SnapshotIntegrity(
+                        "owned disk archive source length differs".into(),
+                    ));
+                }
+                if let Some(expected) = &layer.integrity_root
+                    && microsandbox_image::checkpoint::sparse_file_integrity(&path)?.root
+                        != *expected
                 {
                     return Err(MicrosandboxError::SnapshotIntegrity(
                         "owned disk archive source integrity differs".into(),

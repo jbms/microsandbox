@@ -20,6 +20,8 @@ mod runner;
 
 #[cfg(all(feature = "client", windows))]
 pub use client::disk_lock_handoff;
+#[cfg(all(feature = "client", target_os = "linux"))]
+pub use client::memory_handoff;
 #[cfg(feature = "client")]
 pub use client::{
     boot_error, control, ipc, launch, launch_protocol, logging, maintenance, startup_progress,

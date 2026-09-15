@@ -8,6 +8,9 @@
 mod create;
 #[cfg(target_os = "linux")]
 mod process_exit;
+#[cfg(target_os = "macos")]
+#[path = "process_exit_macos.rs"]
+mod process_exit;
 mod stop;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -328,9 +331,9 @@ impl LocalBackend {
         }
 
         let mut pids = Vec::new();
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let exit_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         let departing = process_exit::RuntimeExit::capture(
             pid,
             &microsandbox_runtime::ipc::lifecycle_lock_path(&self.config().run_dir(), name),
@@ -353,7 +356,7 @@ impl LocalBackend {
         }
 
         let all_dead = pids.is_empty() || pids.iter().all(|pid| Self::pid_has_exited(*pid));
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         if let Some(departing) = departing {
             tokio::time::timeout_at(exit_deadline, async {
                 while !departing.has_exited()? {
@@ -1822,6 +1825,7 @@ mod tests {
         let pools = backend.db().await.unwrap();
         let mut config = test_config("abandoned");
         config.checkpoint_restore = Some(microsandbox_runtime::launch::CheckpointRestoreConfig {
+            memory_descriptor: false,
             network_gateway_mac: None,
             external_mount_policy: Default::default(),
             external_mounts: Vec::new(),

@@ -1375,6 +1375,7 @@ impl SandboxBuilder {
                 }
                 self.config.checkpoint_restore =
                     Some(microsandbox_runtime::launch::CheckpointRestoreConfig {
+                        memory_descriptor: false,
                         network_gateway_mac: if self.config.snapshot_restore_mode
                             == SnapshotRestoreMode::Full
                         {
@@ -3649,6 +3650,7 @@ mod tests {
         let mut builder = SandboxBuilder::new("forked-child").image("alpine").forked();
         builder.config.checkpoint_restore =
             Some(microsandbox_runtime::launch::CheckpointRestoreConfig {
+                memory_descriptor: false,
                 network_gateway_mac: None,
                 external_mount_policy: Default::default(),
                 external_mounts: Vec::new(),

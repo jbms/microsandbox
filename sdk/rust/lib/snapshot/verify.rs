@@ -136,8 +136,14 @@ pub(super) async fn verify_snapshot(snap: &Snapshot) -> MicrosandboxResult<Snaps
                         .path()
                         .join("layers")
                         .join(format!("{}.{}", layer.layer_id, layer.format));
-                    if microsandbox_image::checkpoint::sparse_file_integrity(&path)?.root
-                        != layer.integrity_root
+                    if std::fs::metadata(&path)?.len() != layer.file_size {
+                        return Err(MicrosandboxError::SnapshotIntegrity(
+                            "owned disk payload length differs".into(),
+                        ));
+                    }
+                    if let Some(expected) = &layer.integrity_root
+                        && microsandbox_image::checkpoint::sparse_file_integrity(&path)?.root
+                            != *expected
                     {
                         return Err(MicrosandboxError::SnapshotIntegrity(
                             "owned disk payload integrity differs".into(),

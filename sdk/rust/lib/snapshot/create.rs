@@ -298,6 +298,7 @@ async fn capture_installed(
             &source_sandbox,
             labels,
             model,
+            record_integrity,
         )
         .await;
     }
@@ -442,6 +443,7 @@ async fn create_full_snapshot(
     source_sandbox: &str,
     labels: Vec<(String, String)>,
     model: sandbox_entity::Model,
+    record_integrity: bool,
 ) -> MicrosandboxResult<StagedSnapshot> {
     let dest_dir = destination.path;
     let total_started = Instant::now();
@@ -459,7 +461,8 @@ async fn create_full_snapshot(
     // The runtime owns capture and recovery even if this client disappears. Do not allocate an
     // artifact staging directory while waiting for it: there is nothing to stage until capture
     // succeeds. The guard also removes partial materialization on ordinary errors/cancellation.
-    let captured = capture_full_snapshot(local, source_sandbox, labels, model).await?;
+    let captured =
+        capture_full_snapshot(local, source_sandbox, labels, model, record_integrity).await?;
     let capture_us = capture_started.elapsed().as_micros();
     stage_full_snapshot(
         destination,
@@ -603,7 +606,8 @@ pub(super) async fn create_snapshot_archive(
     }
     if full {
         let capture_started = Instant::now();
-        let mut captured = capture_full_snapshot(local, &source_sandbox, labels, model).await?;
+        let mut captured =
+            capture_full_snapshot(local, &source_sandbox, labels, model, record_integrity).await?;
         lineage
             .validate_source(local, &source_sandbox)
             .await
@@ -848,6 +852,7 @@ async fn capture_full_snapshot(
     source_sandbox: &str,
     labels: Vec<(String, String)>,
     model: sandbox_entity::Model,
+    record_integrity: bool,
 ) -> MicrosandboxResult<CapturedFullSnapshot> {
     if model.status != SandboxStatus::Running {
         return Err(MicrosandboxError::unsupported(
@@ -866,9 +871,13 @@ async fn capture_full_snapshot(
     let root_disk = snapshot_root_disk(sandbox_config.spec.image.oci_root_disk(), source_sandbox)?;
 
     let checkpoint_id = format!("checkpoint_{:032x}", rand::random::<u128>());
-    let outcome =
-        crate::sandbox::control_checkpoint_create(local, source_sandbox, checkpoint_id.clone())
-            .await?;
+    let outcome = crate::sandbox::control_checkpoint_create(
+        local,
+        source_sandbox,
+        checkpoint_id.clone(),
+        record_integrity,
+    )
+    .await?;
     let checkpoint = outcome.checkpoint;
     let validated = (|| {
         if checkpoint.checkpoint_id != checkpoint_id {
@@ -1605,8 +1614,14 @@ fn copy_owned_payloads(
                 let target = destination
                     .join("layers")
                     .join(format!("{}.{}", layer.layer_id, layer.format));
-                if microsandbox_image::checkpoint::sparse_file_integrity(&target)?.root
-                    != layer.integrity_root
+                if std::fs::metadata(&target)?.len() != layer.file_size {
+                    return Err(MicrosandboxError::SnapshotIntegrity(
+                        "copied owned disk length differs".into(),
+                    ));
+                }
+                if let Some(expected) = &layer.integrity_root
+                    && microsandbox_image::checkpoint::sparse_file_integrity(&target)?.root
+                        != *expected
                 {
                     return Err(MicrosandboxError::SnapshotIntegrity(
                         "copied owned disk integrity differs".into(),
@@ -1781,6 +1796,46 @@ pub(crate) fn materialize_checkpoint_closure(
 /// durable. Persistent disk successors are published separately before guest activation.
 pub(crate) fn stage_checkpoint_closure(source: &Path, destination: &Path) -> std::io::Result<()> {
     materialize_checkpoint_tree(source, destination, false)
+}
+
+/// Retain immutable local capture files without copying RAM or publishing a snapshot.
+pub(crate) fn stage_local_branch_closure(source: &Path, destination: &Path) -> std::io::Result<()> {
+    // Batch staging and children are on the same sandbox filesystem. Require links rather
+    // than silently copying large disk layers; RAM is outside this tree and stays pinned.
+    std::fs::create_dir_all(destination)?;
+    for member in [
+        "objects",
+        "layers",
+        "owned",
+        "local-disk-admission.json",
+        "branch.json",
+    ] {
+        let path = source.join(member);
+        if member != "branch.json" && !path.try_exists()? {
+            continue;
+        }
+        link_local_branch_member(&path, &destination.join(member))?;
+    }
+    Ok(())
+}
+
+fn link_local_branch_member(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(source)?;
+    if metadata.is_file() {
+        std::fs::hard_link(source, destination)
+    } else if metadata.is_dir() {
+        std::fs::create_dir(destination)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            link_local_branch_member(&entry.path(), &destination.join(entry.file_name()))?;
+        }
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "local branch member is not a regular file or directory",
+        ))
+    }
 }
 
 fn materialize_checkpoint_tree(
@@ -2012,6 +2067,25 @@ mod tests {
 
     const CAPTURE_BASE_ID: &str = "layer_00000000000000000000000000000001";
 
+    #[test]
+    fn batch_staging_retains_owned_payloads_after_the_first_child_is_removed() {
+        let source = tempfile::tempdir().unwrap();
+        let batch = tempfile::tempdir().unwrap();
+        let sibling = tempfile::tempdir().unwrap();
+        let payload = "owned/mount-test/payloads/data";
+        std::fs::create_dir_all(source.path().join("owned/mount-test/payloads")).unwrap();
+        std::fs::write(source.path().join(payload), b"captured owned data").unwrap();
+        std::fs::write(source.path().join("branch.json"), b"{}").unwrap();
+        stage_local_branch_closure(source.path(), batch.path()).unwrap();
+        source.close().unwrap();
+        stage_local_branch_closure(batch.path(), sibling.path()).unwrap();
+        batch.close().unwrap();
+        assert_eq!(
+            std::fs::read(sibling.path().join(payload)).unwrap(),
+            b"captured owned data"
+        );
+    }
+
     async fn fixture_source(local: &LocalBackend) {
         let mut config = SandboxConfig::default();
         config.spec.name = "box".into();
@@ -2057,9 +2131,10 @@ mod tests {
             layers: vec![DiskLayerRef {
                 layer_id: CAPTURE_BASE_ID.into(),
                 format: "raw".into(),
+                file_size: b"sealed root".len() as u64,
                 virtual_size: 4096,
                 predecessor: None,
-                integrity_root: format!("blake3:{}", "a".repeat(64)),
+                integrity_root: Some(format!("blake3:{}", "a".repeat(64))),
             }],
             head: CAPTURE_BASE_ID.into(),
             pause_generation: 1,
@@ -2929,7 +3004,9 @@ mod tests {
                 std::fs::write(&raw_path, vec![91; 65536]).unwrap();
                 base.disk.device_id = device.into();
                 base.disk.layers[0].virtual_size = 65536;
-                base.disk.layers[0].integrity_root = sparse_file_integrity(&raw_path).unwrap().root;
+                base.disk.layers[0].file_size = std::fs::metadata(&raw_path).unwrap().len();
+                base.disk.layers[0].integrity_root =
+                    Some(sparse_file_integrity(&raw_path).unwrap().root);
                 let generation = base.disk.clone();
                 let base = validate_live_disk_capture(base, "disk_capture", base_cut, device, &[])
                     .unwrap();
@@ -2954,7 +3031,8 @@ mod tests {
                     format: "qcow2".into(),
                     virtual_size: 65536,
                     predecessor: Some(CAPTURE_BASE_ID.into()),
-                    integrity_root: sparse_file_integrity(&head_path).unwrap().root,
+                    file_size: std::fs::metadata(&head_path).unwrap().len(),
+                    integrity_root: Some(sparse_file_integrity(&head_path).unwrap().root),
                 });
                 let head = validate_live_disk_capture(head, "disk_capture", head_cut, device, &[])
                     .unwrap();

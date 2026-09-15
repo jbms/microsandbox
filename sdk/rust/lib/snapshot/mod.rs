@@ -370,10 +370,10 @@ pub(crate) async fn materialize_archive_for_child(
 }
 
 pub(crate) use restore::{
-    apply_additional_disks, materialize_additional_disks, materialize_checkpoint_child_disk_state,
-    materialize_checkpoint_child_state, materialize_checkpoint_disk_for_child,
-    materialize_checkpoint_for_child, materialize_file_snapshot_for_child,
-    materialize_owned_volumes, root_device,
+    adopt_local_branch_for_child, apply_additional_disks, materialize_additional_disks,
+    materialize_checkpoint_child_disk_state, materialize_checkpoint_child_state,
+    materialize_checkpoint_disk_for_child, materialize_checkpoint_for_child,
+    materialize_file_snapshot_for_child, materialize_owned_volumes, root_device,
 };
 
 pub(crate) use create::{
@@ -602,6 +602,7 @@ impl SnapshotBuilder {
 #[cfg(feature = "fuzzing")]
 pub use archive::fuzz_unpack_archive;
 pub use archive::{LoadOpts, SaveOpts};
+pub(crate) use create::stage_local_branch_closure;
 pub use group::{HeadUpdate, HeadUpdateReason};
 pub use microsandbox_image::snapshot::{
     CheckpointSnapshotState, DESCRIPTOR_FILENAME, DiskLayer, DiskLayerId, FileSnapshotState,

@@ -524,7 +524,7 @@ mod tests {
                     microsandbox_image::checkpoint::sparse_file_integrity(&path)
                         .unwrap()
                         .root,
-                    layer.integrity_root
+                    *layer.integrity_root.as_ref().expect("owned disk integrity")
                 );
             }
         }

@@ -318,7 +318,8 @@ export interface NapiSandbox {
   attachShell(): Promise<number>;
   restoreWarnings(): Promise<Array<{ guestPath: string; reason: string; staleInodes: bigint[] }>>;
   stop(): Promise<void>;
-  branch(name: string): Promise<NapiSandbox>;
+  branch(name: string, recordIntegrity?: boolean): Promise<NapiSandbox>;
+  branchMany(names: string[], recordIntegrity?: boolean): Promise<{name: string; sandbox?: NapiSandbox; error?: string}[]>;
   pause(): Promise<void>;
   resume(): Promise<void>;
   requestStop(): Promise<void>;
@@ -356,7 +357,8 @@ export interface NapiSandboxHandle {
   connectWithTimeout(timeoutMs: number): Promise<NapiSandbox>;
   connectOrStart(detached?: boolean): Promise<NapiSandbox>;
   stop(): Promise<void>;
-  branch(name: string): Promise<NapiSandbox>;
+  branch(name: string, recordIntegrity?: boolean): Promise<NapiSandbox>;
+  branchMany(names: string[], recordIntegrity?: boolean): Promise<{name: string; sandbox?: NapiSandbox; error?: string}[]>;
   pause(): Promise<void>;
   resume(): Promise<void>;
   requestStop(): Promise<void>;

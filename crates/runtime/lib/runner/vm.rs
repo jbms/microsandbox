@@ -51,7 +51,8 @@ use crate::launch::FileMountConfig;
 #[cfg(unix)]
 pub use crate::launch::LIFECYCLE_LOCK_FD;
 pub use crate::launch::{
-    CONFIG_FD, MetricsSlotHandoff, PARENT_WATCH_DETACH, PARENT_WATCH_FD, STARTUP_FD, StartupCommand,
+    BRANCH_MEMORY_FD, CONFIG_FD, MetricsSlotHandoff, PARENT_WATCH_DETACH, PARENT_WATCH_FD,
+    STARTUP_FD, StartupCommand,
 };
 use crate::logging::LogLevel;
 use crate::metrics::run_metrics_sampler;
@@ -1040,7 +1041,7 @@ fn run(
         bootstrap_frame,
         resolved_bootstrap,
         bind_identity_map,
-        restored_agent,
+        mut restored_agent,
         owned_directory_checkpoints,
     ) = match build_result {
         Ok(vm) => vm,
@@ -1118,6 +1119,9 @@ fn run(
             &config.agent_sock_path,
             Arc::clone(&shared.workload_control),
             Arc::clone(&shared.resident_paused),
+            restored_agent
+                .as_mut()
+                .and_then(|agent| agent.inherited_memory.take()),
             owned_directory_checkpoints,
         );
         let context = super::control::ControlContext {
@@ -1841,6 +1845,7 @@ fn build_vm(
                 crate::checkpoint::PreparedCheckpointRestore::open_local(
                     restore.closure.clone(),
                     &restore.checkpoint_id,
+                    restore.memory_descriptor,
                 )
             } else {
                 crate::checkpoint::PreparedCheckpointRestore::open(
@@ -2666,12 +2671,11 @@ fn build_vm(
         .map_err(|e| RuntimeError::Custom(format!("build VM: {e}")))?;
     let restored_agent = if let Some(restore) = &config.vm.checkpoint_restore {
         let prepared = prepared_restore.expect("restore was admitted before device construction");
-        if let Some(admitted) = prepared.disk_closure() {
-            // Reuse this process's exact admitted file bindings before the closure is moved
-            // into RAM restoration. The later coordinator opens the completed journal.
-            crate::checkpoint::seed_restored_root_disk(&config.runtime_dir, &config.vm, admitted)
-                .map_err(RuntimeError::Custom)?;
-        }
+        // Local branches and durable restores both retain exact immutable disk bindings.
+        // Seed before moving the prepared sources into VM construction.
+        prepared
+            .seed_root_disk(&config.runtime_dir, &config.vm)
+            .map_err(RuntimeError::Custom)?;
         let cache_root = restore
             .forked
             .then(|| {

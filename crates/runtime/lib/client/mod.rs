@@ -13,4 +13,6 @@ pub mod launch;
 pub mod launch_protocol;
 pub mod logging;
 pub mod maintenance;
+#[cfg(target_os = "linux")]
+pub mod memory_handoff;
 pub mod startup_progress;

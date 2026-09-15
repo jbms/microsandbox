@@ -142,8 +142,13 @@ fn stage_owned_disk(
         } else {
             microsandbox_utils::copy::fast_copy(&source, &target)?;
         }
-        if microsandbox_image::checkpoint::sparse_file_integrity(&target)?.root
-            != layer.integrity_root
+        if std::fs::metadata(&target)?.len() != layer.file_size {
+            return Err(invalid(
+                "owned disk length changed during child materialization",
+            ));
+        }
+        if let Some(expected) = &layer.integrity_root
+            && microsandbox_image::checkpoint::sparse_file_integrity(&target)?.root != *expected
         {
             return Err(invalid("owned disk changed during child materialization"));
         }
@@ -258,16 +263,18 @@ mod tests {
                         DiskLayerRef {
                             layer_id: "base".into(),
                             format: "raw".into(),
+                            file_size: std::fs::metadata(&base).unwrap().len(),
                             virtual_size: 1024 * 1024,
                             predecessor: None,
-                            integrity_root: sparse_file_integrity(&base).unwrap().root,
+                            integrity_root: Some(sparse_file_integrity(&base).unwrap().root),
                         },
                         DiskLayerRef {
                             layer_id: "change".into(),
                             format: "qcow2".into(),
+                            file_size: std::fs::metadata(&upper).unwrap().len(),
                             virtual_size: 1024 * 1024,
                             predecessor: Some("base".into()),
-                            integrity_root: sparse_file_integrity(&upper).unwrap().root,
+                            integrity_root: Some(sparse_file_integrity(&upper).unwrap().root),
                         },
                     ],
                 },
@@ -323,6 +330,38 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn owned_chain_without_capture_hashes_still_checks_physical_lengths() {
+        for truncate in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let source = home.path().join("snapshot");
+            let mut volume = fixture(&source).await;
+            let OwnedVolumeData::Disk { generation } = &mut volume.data else {
+                unreachable!()
+            };
+            for layer in &mut generation.layers {
+                layer.integrity_root = None;
+            }
+            if truncate {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(source.join("layers/base.raw"))
+                    .unwrap()
+                    .set_len(512)
+                    .unwrap();
+            }
+            let child = home.path().join("child");
+            let result =
+                materialize_owned_volumes(&[volume], &source, &child, &Default::default()).await;
+            if truncate {
+                assert!(result.is_err());
+                assert!(!child.exists(), "invalid backing was published");
+            } else {
+                result.unwrap();
+            }
+        }
     }
 
     #[tokio::test]

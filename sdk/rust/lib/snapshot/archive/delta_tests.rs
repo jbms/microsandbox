@@ -98,11 +98,12 @@ async fn fixture(
             std::fs::write(&layer_path, vec![17u8; 65536]).unwrap();
         }
         let layer = DiskLayerRef {
+            file_size: std::fs::metadata(&layer_path).unwrap().len(),
             layer_id: layer_id.clone(),
             format: format.into(),
             virtual_size: 65536,
             predecessor: layers.last().map(|layer| layer.layer_id.clone()),
-            integrity_root: sparse_file_integrity(&layer_path).unwrap().root,
+            integrity_root: Some(sparse_file_integrity(&layer_path).unwrap().root),
         };
         layers.push(layer);
         let disk = DiskGenerationManifest {
@@ -310,7 +311,8 @@ async fn with_owned_volumes(local: &LocalBackend, snapshot: Snapshot, generation
             format: "raw".into(),
             virtual_size: 1024 * 1024,
             predecessor: None,
-            integrity_root: sparse_file_integrity(&path).unwrap().root,
+            file_size: std::fs::metadata(&path).unwrap().len(),
+            integrity_root: Some(sparse_file_integrity(&path).unwrap().root),
         }],
     };
     checkpoint.disks.push(
@@ -423,7 +425,7 @@ async fn with_owned_disk_chain(
                 .unwrap();
             assert_eq!(
                 sparse_file_integrity(&target).unwrap().root,
-                layer.integrity_root
+                *layer.integrity_root.as_ref().expect("owned disk integrity")
             );
             generation.layers.push(layer.clone());
         }
@@ -448,7 +450,8 @@ async fn with_owned_disk_chain(
             format: "qcow2".into(),
             virtual_size: 1024 * 1024,
             predecessor: Some(predecessor.layer_id.clone()),
-            integrity_root: sparse_file_integrity(&path).unwrap().root,
+            file_size: std::fs::metadata(&path).unwrap().len(),
+            integrity_root: Some(sparse_file_integrity(&path).unwrap().root),
         });
         generation.head = layer_id;
     }
@@ -761,7 +764,7 @@ async fn owned_qcow2_delta_borrows_exact_prefix_and_survives_source_deletion() {
     let borrowed = root.join("layers").join(borrowed);
     assert_ne!(std::fs::metadata(&borrowed).unwrap().len(), 1024 * 1024);
     let identity = OwnedPayloadIdentity::Disk {
-        integrity_root: disk.layers[1].integrity_root.clone(),
+        integrity_root: disk.layers[1].integrity_root.clone().unwrap(),
         bytes: 1024 * 1024,
     };
     verify_owned_payload(&borrowed, &identity).await.unwrap();
@@ -769,7 +772,7 @@ async fn owned_qcow2_delta_borrows_exact_prefix_and_survives_source_deletion() {
         verify_owned_payload(
             &borrowed,
             &OwnedPayloadIdentity::Disk {
-                integrity_root: disk.layers[1].integrity_root.clone(),
+                integrity_root: disk.layers[1].integrity_root.clone().unwrap(),
                 bytes: 2 * 1024 * 1024,
             }
         )
@@ -780,6 +783,44 @@ async fn owned_qcow2_delta_borrows_exact_prefix_and_survives_source_deletion() {
     microsandbox_image::checkpoint::relocate_qcow2_backing(&borrowed, Path::new("different.raw"))
         .unwrap();
     assert!(verify_owned_payload(&borrowed, &identity).await.is_err());
+}
+
+#[tokio::test]
+async fn hashless_owned_layers_are_not_omitted_as_borrowed_dependencies() {
+    use microsandbox_image::snapshot::OwnedVolumeData;
+
+    let temp = tempfile::tempdir().unwrap();
+    let local = LocalBackend::builder()
+        .home(temp.path().join("home"))
+        .build()
+        .await
+        .unwrap();
+    let snapshot = fixture(&local, &temp.path().join("base"), 2, None, false).await;
+    let snapshot = with_owned_volumes(&local, snapshot, 2).await;
+    let mut manifest = snapshot.manifest().clone();
+    let mut volumes = manifest.owned_volumes().unwrap();
+    for volume in &mut volumes {
+        if let OwnedVolumeData::Disk { generation } = &mut volume.data {
+            for layer in &mut generation.layers {
+                layer.integrity_root = None;
+            }
+        }
+    }
+    manifest.set_owned_volumes(volumes).unwrap();
+    // Planning has no filesystem root and must neither open ambient relative paths nor
+    // claim that a hashless layer has the old hash-based owned dependency identity.
+    let required = owned_since_dependencies(&manifest, &manifest).unwrap();
+    assert!(
+        required
+            .iter()
+            .all(|payload| matches!(payload.identity, OwnedPayloadIdentity::Directory { .. }))
+    );
+    let payloads = owned_payloads(&manifest, Path::new("")).unwrap();
+    assert!(
+        payloads
+            .iter()
+            .all(|(payload, _)| matches!(payload.identity, OwnedPayloadIdentity::Directory { .. }))
+    );
 }
 
 #[tokio::test]
@@ -811,7 +852,9 @@ async fn owned_since_refuses_compacted_or_reinterpreted_prefix_and_allows_new_de
                 generation.layers[0].layer_id = "replaced".into();
                 generation.layers[1].predecessor = Some("replaced".into());
             }
-            "hash" => generation.layers[0].integrity_root = format!("blake3:{}", "f".repeat(64)),
+            "hash" => {
+                generation.layers[0].integrity_root = Some(format!("blake3:{}", "f".repeat(64)))
+            }
             "compacted" => {
                 generation.layers.remove(0);
                 generation.layers[0].predecessor = None;
@@ -870,7 +913,7 @@ async fn owned_since_refuses_compacted_or_reinterpreted_prefix_and_allows_new_de
     let OwnedVolumeData::Disk { generation } = &mut volumes.last_mut().unwrap().data else {
         unreachable!()
     };
-    generation.layers[0].integrity_root = format!("blake3:{}", "e".repeat(64));
+    generation.layers[0].integrity_root = Some(format!("blake3:{}", "e".repeat(64)));
     target.set_owned_volumes(volumes).unwrap();
     let error = owned_since_dependencies(&target, &same_devices).unwrap_err();
     assert!(
@@ -1204,11 +1247,12 @@ async fn with_additional_disks(
             device_id: format!("data_{number}"),
             generation,
             layers: vec![DiskLayerRef {
+                file_size: std::fs::metadata(&path).unwrap().len(),
                 layer_id: layer_id.clone(),
                 format: "raw".into(),
                 virtual_size: 65536,
                 predecessor: None,
-                integrity_root: sparse_file_integrity(&path).unwrap().root,
+                integrity_root: Some(sparse_file_integrity(&path).unwrap().root),
             }],
             head: layer_id,
             pause_generation: checkpoint.pause_generation,
