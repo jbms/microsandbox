@@ -112,15 +112,7 @@ pub fn decode_legacy(bytes: &[u8]) -> Result<LaunchConfig, String> {
     if object.contains_key("execution") || object.contains_key("checkpoint_restore") {
         return Err("legacy sandbox launcher accepts boot-only payloads; use machine for explicit execution intent".into());
     }
-    object.insert("execution".into(), Value::String("boot".into()));
-    // Pre-v0.6.17 SDKs send a flat network object. Preserve all its policy values;
-    // deserializing that object directly as NetworkConfig at the wrong level defaults them.
-    if let Some(network) = object.get_mut("network").filter(|v| !v.is_null())
-        && network.get("config").is_none()
-    {
-        *network = serde_json::json!({"config": network.clone(), "outbound_proxy": null});
-    }
-    let config = LaunchConfig::decode(&serde_json::to_vec(&value).map_err(|e| e.to_string())?)?;
+    let config = LaunchConfig::from_json(bytes)?;
     if !config.rootfs.disk_layers.is_empty() || !config.rootfs.upper_layers.is_empty() {
         return Err("legacy sandbox launcher does not accept checkpoint disk chains".into());
     }

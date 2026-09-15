@@ -1,5 +1,7 @@
 //! Entry point for the `msb` CLI binary.
 
+mod embedded_version;
+
 use std::io::{IsTerminal, Write};
 
 use clap::{CommandFactory, Parser, Subcommand};
@@ -56,7 +58,7 @@ const TOP_LEVEL_COMMAND_GROUPS: &[CommandGroup] = &[
 #[derive(Parser)]
 #[command(
     name = "msb",
-    version,
+    version = embedded_version::version(),
     about = format!("Microsandbox CLI v{}", env!("CARGO_PKG_VERSION")),
     styles = microsandbox_cli::styles::styles()
 )]

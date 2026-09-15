@@ -83,6 +83,7 @@ export interface NativeBindings {
     outputPath: string,
     format?: string,
   ) => Promise<void>;
+  readonly resolveRuntimeVersion: (executable: string) => Promise<string | null>;
   readonly resolveRuntime: (configJson: string) => string;
   readonly isRuntimeInstalled: (configJson: string) => boolean;
   readonly installRuntime: (configJson: string, optionsJson: string) => Promise<string>;

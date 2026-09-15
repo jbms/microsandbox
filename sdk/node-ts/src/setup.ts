@@ -102,3 +102,13 @@ export async function ensureRuntime(
     ),
   );
 }
+
+/**
+ * Read the version embedded in an executable without running it.
+ * Returns null for older executables without the version section. Invalid
+ * executables, malformed version sections and file access failures reject.
+ * No firmware, installation, network access or `--version` fallback is needed.
+ */
+export async function resolveRuntimeVersion(executable: string): Promise<string | null> {
+  return (await withMappedErrors(() => napi.resolveRuntimeVersion(executable))) ?? null;
+}

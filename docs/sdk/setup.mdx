@@ -91,6 +91,28 @@ Microsandbox.install unless Microsandbox.installed?
 
 Ruby retains its existing setup API. Go's first setup call may materialize and load the SDK's embedded FFI library, as other Go SDK operations do; resolving does not install `msb` or `libkrunfw`.
 
+## Read a runtime version
+
+TypeScript and Rust can read the Cargo package version embedded in an `msb` executable without running it. This is an optional inspection of the specified file; firmware and a complete runtime installation are not required.
+
+<CodeGroup>
+```typescript TypeScript
+import { resolveRuntimeVersion } from "microsandbox";
+
+const version = await resolveRuntimeVersion("/path/to/msb");
+```
+
+```rust Rust
+use microsandbox::setup::resolve_runtime_version;
+
+let version = resolve_runtime_version("/path/to/msb")?;
+```
+</CodeGroup>
+
+Rust returns `Option<setup::Version>` and TypeScript returns `string | null`. Older executables without the version section produce `None` or `null`. Invalid executable metadata, malformed version sections and file access failures are errors. The reader supports ELF, PE and thin or universal Mach-O files, limits metadata reads to 4 MiB and version contents to 256 bytes, and never falls back to executing `msb --version`. Universal Mach-O slices must agree on the version, including section absence. The version identifies the build; it does not authenticate the executable or guarantee feature compatibility.
+
+Sandbox startup separately resolves a tested launch contract for the selected runtime. When embedded version metadata is absent, startup may run a bounded `msb --version` probe and cache the result for that native executable's identity within the SDK process. Replacing the executable invalidates that cache. This startup behavior does not change the read-only version inspection methods above.
+
 ## Customize installation
 
 Python, TypeScript, and Go accept a `RuntimeConfig` and `InstallOptions`. Their per-call home and binary-path overrides are layered on persisted global configuration. Rust accepts `GlobalConfig` and `InstallOptions` directly. Environment binary-path overrides retain the highest priority.

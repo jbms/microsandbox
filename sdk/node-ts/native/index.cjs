@@ -685,6 +685,7 @@ module.exports.imageRemove = nativeBinding.imageRemove
 module.exports.imageSave = nativeBinding.imageSave
 module.exports.popDefaultBackend = nativeBinding.popDefaultBackend
 module.exports.pushDefaultBackend = nativeBinding.pushDefaultBackend
+module.exports.resolveRuntimeVersion = nativeBinding.resolveRuntimeVersion
 module.exports.setDefaultBackend = nativeBinding.setDefaultBackend
 module.exports.setPackagedMsbPath = nativeBinding.setPackagedMsbPath
 module.exports.setRuntimeLibkrunfwPath = nativeBinding.setRuntimeLibkrunfwPath

@@ -414,7 +414,7 @@ export type PullProgressEvent = NapiPullProgressEvent;
 export type PullProgressStream = NapiPullProgressStream;
 
 // Setup + module-level helpers
-export { resolveRuntime, isRuntimeInstalled, installRuntime, ensureRuntime } from "./setup.js";
+export { resolveRuntimeVersion, resolveRuntime, isRuntimeInstalled, installRuntime, ensureRuntime } from "./setup.js";
 export type { RuntimeConfig, InstallOptions, ResolvedRuntime, RuntimeOrigin } from "./setup.js";
 export { allSandboxMetrics } from "./all-metrics.js";
 

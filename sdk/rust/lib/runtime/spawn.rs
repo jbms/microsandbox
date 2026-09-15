@@ -324,10 +324,48 @@ pub async fn spawn_sandbox(
     .await?;
     #[cfg(not(feature = "embed-binaries"))]
     let resolved_runtime = crate::setup::resolve_runtime(global)?;
+    ensure_sigchld_handler_uses_alt_stack_before_spawn().await?;
+    let launch_contract = super::launch_contract::resolve(&resolved_runtime.msb_path).await?;
+    launch_contract.validate_capacity(
+        config.spec.resources.cpus,
+        config.spec.resources.max_cpus,
+        config.spec.resources.memory_mib,
+        config.spec.resources.max_memory_mib,
+    )?;
+    if launch_contract.patch < 9
+        && !matches!(
+            global.runtime.block_writeback,
+            BlockWritebackConfig::Auto { pool_mib: None } | BlockWritebackConfig::Off {}
+        )
+    {
+        return Err(MicrosandboxError::Runtime(
+            "explicit block-writeback policy requires a newer runtime launch contract".into(),
+        ));
+    }
+    let catalog_has_writeback =
+        microsandbox_db::catalog::has_table(local.db().await?.read(), "writeback_allocation")
+            .await?;
+    if !catalog_has_writeback
+        && !matches!(
+            global.runtime.block_writeback,
+            BlockWritebackConfig::Auto { pool_mib: None } | BlockWritebackConfig::Off {}
+        )
+    {
+        return Err(MicrosandboxError::Runtime("explicit block-writeback policy requires a catalog with writeback allocation support; the historical catalog was left unchanged".into()));
+    }
     let msb_path = resolved_runtime.msb_path;
     let libkrunfw_path = resolved_runtime.libkrunfw_path;
-    let launch_protocol = super::launch_protocol::negotiate(&msb_path).await?;
-    super::launch_protocol::validate_request(launch_protocol, config)?;
+    // Historical selection uses the cached version contract, never a second process probe.
+    if !launch_contract.machine
+        && (config.checkpoint_restore.is_some()
+            || !config.snapshot_upper_layers.is_empty()
+            || !config.snapshot_root_layer_sources.is_empty())
+    {
+        return Err(MicrosandboxError::Runtime(
+            "checkpoint restore, branch, or disk chains require a newer runtime launch contract"
+                .into(),
+        ));
+    }
     #[cfg(windows)]
     crate::setup::verify_windows_host_prerequisites()?;
     tracing::debug!(
@@ -405,7 +443,7 @@ pub async fn spawn_sandbox(
 
     // Compute the agent relay socket path from the backend being used for
     // this spawn, not from the ambient default backend.
-    let agent_sock_path = resolve_sandbox_agent_socket_path_for(local, &config.spec.name)?;
+    let agent_sock_path = launch_agent_socket_path(local, &config.spec.name, launch_contract)?;
 
     // The pipe name is derived from the sandbox NAME, so a leaked VM process
     // from an earlier run would keep serving it and silently receive the new
@@ -493,7 +531,13 @@ pub async fn spawn_sandbox(
     // #1390: lease from active sandboxes instead of deriving the slot from the
     // ever-increasing sandbox ID.
     #[cfg(feature = "net")]
-    let network_slot = match NetworkSlot::lease(local, sandbox_id).await {
+    let lease = if !launch_contract.machine && launch_contract.patch < 16 {
+        NetworkSlot::lease_legacy(local, sandbox_id).await
+    } else {
+        NetworkSlot::lease(local, sandbox_id).await
+    };
+    #[cfg(feature = "net")]
+    let network_slot = match lease {
         Ok(slot) => slot,
         Err(err) => {
             release_metrics_reservation(config, metrics_reservation.as_ref());
@@ -540,8 +584,16 @@ pub async fn spawn_sandbox(
         pool_bytes = ?writeback_pool_bytes,
         "resolved buffered writeback policy"
     );
-    launch.block_writeback_limit_bytes = writeback_limit_bytes;
-    launch.block_writeback_pool_bytes = writeback_pool_bytes;
+    launch.block_writeback_limit_bytes = if catalog_has_writeback {
+        writeback_limit_bytes
+    } else {
+        None
+    };
+    launch.block_writeback_pool_bytes = if catalog_has_writeback {
+        writeback_pool_bytes
+    } else {
+        None
+    };
     #[cfg(target_os = "linux")]
     let branch_memory_fd = config
         .branch_memory
@@ -559,14 +611,17 @@ pub async fn spawn_sandbox(
             "branch restore is missing its owned memory descriptor".into(),
         ));
     }
-    visible[0] = launch_protocol.command().into();
-    let launch_bytes = match launch_protocol.encode(&launch) {
-        Ok(bytes) => bytes,
+    if !launch_contract.machine {
+        visible[0] = OsString::from("sandbox");
+    }
+    let launch_value = match super::launch_input::encode(&launch, launch_contract) {
+        Ok(launch) => launch,
         Err(error) => {
             release_metrics_reservation(config, metrics_reservation.as_ref());
-            return Err(MicrosandboxError::Runtime(error));
+            return Err(error);
         }
     };
+    let launch_bytes = serde_json::to_vec(&launch_value)?;
     #[cfg(unix)]
     let config_file = match write_launch_config_fd(&launch_bytes) {
         Ok(file) => file,
@@ -583,10 +638,14 @@ pub async fn spawn_sandbox(
         visible.push(OsString::from(
             microsandbox_runtime::vm::CONFIG_FD.to_string(),
         ));
-        visible.push(OsString::from("--lifecycle-lock-fd"));
-        visible.push(OsString::from(
-            microsandbox_runtime::vm::LIFECYCLE_LOCK_FD.to_string(),
-        ));
+        // Older runtimes retain the inherited descriptor without naming it.
+        // Newer runtimes need the argument to adopt it instead of relocking.
+        if launch_contract.lifecycle_lock_argument() {
+            visible.push(OsString::from("--lifecycle-lock-fd"));
+            visible.push(OsString::from(
+                microsandbox_runtime::vm::LIFECYCLE_LOCK_FD.to_string(),
+            ));
+        }
     }
 
     #[cfg(windows)]
@@ -627,9 +686,9 @@ pub async fn spawn_sandbox(
     // mode, which corrupts the parent's terminal output (\n without \r).
     cmd.stdin(Stdio::null());
     #[cfg(windows)]
-    if !disk_locks.is_empty() {
-        // A private, startup-only pipe is not a terminal. Old runtimes reject the flag rather
-        // than booting without adopting ownership. No public agent/control socket is added.
+    if launch_contract.machine && !disk_locks.is_empty() {
+        // A private startup pipe is not a terminal. Only modern runtimes adopt these
+        // handles; historical runtimes retain the existing launcher-owned locks.
         cmd.arg("--disk-locks-stdin");
         cmd.stdin(Stdio::piped());
     }
@@ -786,6 +845,18 @@ pub async fn spawn_sandbox(
     ));
 
     #[cfg(windows)]
+    {
+        let process = super::ownership::RuntimeProcess::capture(_pid as i32)?.ok_or_else(|| {
+            MicrosandboxError::Runtime("runtime exited during ownership capture".into())
+        })?;
+        // Released Windows runtimes started owning the lifecycle lock in v0.6.16.
+        startup_process.handle_mut().ownership = Some((
+            process,
+            launch_contract.machine || launch_contract.patch >= 16,
+        ));
+    }
+
+    #[cfg(windows)]
     if let Err(err) = job_assignment {
         let error = crate::MicrosandboxError::Runtime(format!(
             "failed to assign sandbox process to Windows job: {err}"
@@ -798,7 +869,7 @@ pub async fn spawn_sandbox(
     }
 
     #[cfg(windows)]
-    {
+    if launch_contract.machine {
         let handoff = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             startup_process.handle_mut().handoff_disk_locks(),
@@ -2135,6 +2206,27 @@ fn sandbox_agent_socket_path_candidates_with_roots(
     };
 
     candidates
+}
+
+/// Pre-v0.6.9 runtimes derive control paths by replacing the agent extension.
+/// Give them the flat endpoint whose control name discovery already recognizes.
+fn launch_agent_socket_path(
+    local: &LocalBackend,
+    name: &str,
+    contract: super::launch_contract::LaunchContract,
+) -> MicrosandboxResult<PathBuf> {
+    #[cfg(unix)]
+    if contract.patch < 9 {
+        let paths =
+            microsandbox_runtime::ipc::sandbox_socket_paths(&local.config().run_dir(), name);
+        return resolve_sandbox_agent_socket_path_from_candidates(vec![
+            paths.legacy_agent,
+            in_sandbox_agent_socket_path(&local.sandboxes_dir(), name),
+        ]);
+    }
+    #[cfg(not(unix))]
+    let _ = contract;
+    resolve_sandbox_agent_socket_path_for(local, name)
 }
 
 /// Pick the first explicit-backend socket path usable on this platform.

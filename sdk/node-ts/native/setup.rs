@@ -7,6 +7,19 @@ use crate::error::to_napi_error;
 // Functions
 //--------------------------------------------------------------------------------------------------
 
+/// Read an executable's embedded runtime version without starting it.
+#[napi]
+pub async fn resolve_runtime_version(executable: String) -> Result<Option<String>> {
+    // File access can block on external storage; keep it off the async workers.
+    tokio::task::spawn_blocking(move || {
+        microsandbox::setup::resolve_runtime_version(executable)
+            .map(|version| version.map(|version| version.to_string()))
+            .map_err(to_napi_error)
+    })
+    .await
+    .map_err(|error| Error::from_reason(format!("runtime version reader failed: {error}")))?
+}
+
 /// Resolve the existing runtime pair without installing host binaries.
 #[napi]
 pub fn resolve_runtime(config_json: String) -> Result<String> {
