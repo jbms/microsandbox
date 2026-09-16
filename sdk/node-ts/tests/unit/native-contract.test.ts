@@ -53,8 +53,9 @@ describe("native Sandbox lifecycle contract", () => {
 
   it("exposes narrow destination controls on the dedicated restore builder", () => {
     const builder = new napi.RestoreBuilder("snapshot").name("destination");
-    expect(builder.cpus(2).memory(512).maxConnections(0).disableNetwork()
+    expect(builder.cpus(2).memory(512).maxTcpConnections(0).maxUdpConnections(7).disableNetwork()
       .security("default").maxDuration(0).idleTimeout(0)).toBe(builder);
+    expect(builder.maxConnections(64).maxUdpConnections(0)).toBe(builder);
     expect(() => builder.networkPolicyJson(JSON.stringify({
       default_egress: "deny", default_ingress: "deny", rules: [],
     }))).not.toThrow();

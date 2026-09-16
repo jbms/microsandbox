@@ -45,10 +45,20 @@ pub(super) fn encode(launch: &LaunchConfig, contract: LaunchContract) -> Microsa
         return unsupported("execution restore");
     }
     #[cfg(feature = "net")]
+    if launch
+        .network
+        .as_ref()
+        .is_some_and(|network| network.config().max_udp_connections.is_some())
+    {
+        // Older runtimes ignore this field and impose their own fixed UDP budget.
+        // Refuse explicit intent before launch instead of silently changing its meaning.
+        return unsupported("UDP connection limits");
+    }
+    #[cfg(feature = "net")]
     if let Some(limit) = launch
         .network
         .as_ref()
-        .and_then(|network| network.config().max_connections)
+        .and_then(|network| network.config().max_tcp_connections)
     {
         // Historical engines treat zero as a closed admission budget, reject caps over
         // 4096, and clamp multi-tenant budgets to 256. Preserve explicit intent instead
@@ -140,6 +150,11 @@ pub(super) fn encode(launch: &LaunchConfig, contract: LaunchContract) -> Microsa
         } else {
             &mut value["network"]
         };
+        // Explicit UDP values were rejected above; omit the new optional key
+        // entirely when encoding a historical producer's network object.
+        if let Some(fields) = network.as_object_mut() {
+            fields.remove("max_udp_connections");
+        }
         // Pin the historical default at the boundary; omission on the current contract
         // intentionally has a different meaning and must not broaden an old launch.
         if network["max_connections"].is_null() {
@@ -441,6 +456,68 @@ mod tests {
 
     #[cfg(feature = "net")]
     #[test]
+    fn udp_limits_require_current_launch_contract() {
+        use microsandbox_network::config::{EnvNetworkSecretResolver, NetworkConfig};
+
+        for requested in [None, Some(0), Some(1), Some(256), Some(4097)] {
+            let network: NetworkConfig = serde_json::from_value(json!({
+                "max_connections": 8,
+                "max_udp_connections": requested,
+            }))
+            .unwrap();
+            let launch = LaunchConfig {
+                network: Some(network.resolve(&EnvNetworkSecretResolver).unwrap()),
+                ..Default::default()
+            };
+            let current = encode(
+                &launch,
+                LaunchContract {
+                    patch: 18,
+                    machine: true,
+                },
+            )
+            .unwrap();
+            assert_eq!(current["network"]["config"]["max_connections"], 8);
+            assert_eq!(
+                current["network"]["config"]["max_udp_connections"],
+                json!(requested)
+            );
+            assert!(
+                current["network"]["config"]
+                    .get("max_tcp_connections")
+                    .is_none()
+            );
+            for patch in 0..=18 {
+                let result = encode(
+                    &launch,
+                    LaunchContract {
+                        patch,
+                        machine: false,
+                    },
+                );
+                if requested.is_some() {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("UDP connection limits")
+                    );
+                } else {
+                    let value = result.unwrap();
+                    let network = if patch >= 17 {
+                        &value["network"]["config"]
+                    } else {
+                        &value["network"]
+                    };
+                    assert_eq!(network["max_connections"], 8);
+                    assert!(network.get("max_udp_connections").is_none());
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
     fn legacy_network_limits_reject_changed_meanings_before_launch() {
         use microsandbox_network::config::{EnvNetworkSecretResolver, NetworkConfig};
         use microsandbox_types::DeploymentProfile;
@@ -671,6 +748,10 @@ mod tests {
             .unwrap();
             let mut expected = expected.clone();
             expected["config"]["max_connections"] = json!(256);
+            expected["config"]
+                .as_object_mut()
+                .unwrap()
+                .remove("max_udp_connections");
             if let Some(secrets) = expected["config"]
                 .get_mut("secrets")
                 .and_then(Value::as_object_mut)

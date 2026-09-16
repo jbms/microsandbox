@@ -1814,6 +1814,8 @@ type NetworkOptions struct {
 	IPv4Pool              string                     `json:"ipv4_pool,omitempty"`
 	IPv6Pool              string                     `json:"ipv6_pool,omitempty"`
 	MaxConnections        *uint                      `json:"max_connections,omitempty"`
+	MaxTCPConnections     *uint                      `json:"max_tcp_connections,omitempty"`
+	MaxUDPConnections     *uint                      `json:"max_udp_connections,omitempty"`
 	RateLimiter           *NetworkRateLimiterOptions `json:"rate_limiter,omitempty"`
 	SecretViolationAction string                     `json:"secret_violation_action,omitempty"`
 	TrustHostCAs          *bool                      `json:"trust_host_cas,omitempty"`

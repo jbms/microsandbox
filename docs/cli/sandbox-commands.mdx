@@ -237,7 +237,9 @@ msb sbx restore ./saved.msb --name disk-copy --disk-only
 | `--no-net` | Deny traffic in both directions by default; keeps the captured device and accepts explicit allow rules |
 | `--net-default` | Set both traffic defaults to `allow` or `deny` |
 | `--net-rule` | Repeatable host-policy rule; requires `--net-default` or `--no-net` |
-| `--max-connections` | Concurrent TCP limit; zero explicitly means unlimited |
+| `--max-tcp-connections` | Concurrent TCP limit; zero explicitly means unlimited |
+| `--max-udp-connections` | Concurrent UDP session limit; zero explicitly means unlimited |
+| `--max-connections` | Deprecated TCP-only alias; cannot be combined with `--max-tcp-connections` |
 | `--max-duration` | Destination sandbox lifetime bound, e.g. `10m` |
 | `--idle-timeout` | Destination inactivity bound, e.g. `2m` |
 | `-q`, `--quiet` | Hide progress, but not unavailable-resource warnings |

@@ -858,6 +858,33 @@ func TestFFIWireShape_SOCKS4Proxy(t *testing.T) {
 	}
 }
 
+func TestFFIWireShape_NetworkConnectionLimits(t *testing.T) {
+	zero, finite := uint(0), uint(7)
+	for _, test := range []struct {
+		name    string
+		network *NetworkConfig
+		want    map[string]any
+	}{
+		{"omitted", &NetworkConfig{}, map[string]any{}},
+		{"canonical", &NetworkConfig{MaxTCPConnections: &zero, MaxUDPConnections: &finite, SecretViolationAction: ViolationActionBlockAndLog}, map[string]any{"max_tcp_connections": float64(0), "max_udp_connections": float64(7)}},
+		{"legacy", &NetworkConfig{MaxConnections: &finite, MaxUDPConnections: &zero}, map[string]any{"max_connections": float64(7), "max_udp_connections": float64(0)}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := marshalCreateOptions(t, WithNetwork(test.network))["network"].(map[string]any)
+			if action := test.network.SecretViolationAction; action != "" && got["secret_violation_action"] != string(action) {
+				t.Fatalf("connection limits discarded the secret violation action: %#v", got)
+			}
+			for _, field := range []string{"max_connections", "max_tcp_connections", "max_udp_connections"} {
+				actual, present := got[field]
+				want, expected := test.want[field]
+				if present != expected || actual != want {
+					t.Errorf("%s = %#v (present %v), want %#v (present %v)", field, actual, present, want, expected)
+				}
+			}
+		})
+	}
+}
+
 func TestBuildFFINetworkRateLimiters(t *testing.T) {
 	out := buildFFINetwork(&NetworkConfig{
 		RateLimiter: &NetworkRateLimiterConfig{

@@ -146,6 +146,8 @@ In v0.7.0, the private launcher is `msb machine`; `msb sandbox` is the public co
 
 Complete historical invocations use the separate boot-only decoder; `msb machine` retains strict execution-intent validation. Runtime selection keeps the unified setup API and its installed-binary precedence. Launch selection uses our embedded-version reader and cached historical contracts, without additional capability/help probes.
 
+TCP limits retain the serialized `max_connections` key despite the canonical SDK field becoming `max_tcp_connections`. Optional UDP limits use `max_udp_connections`. Historical launches retain their TCP defaults/clamps and fixed 256-session UDP budget; explicit UDP limits require the current launch contract and are rejected before launching an older runtime. This prevents either direction of SDK/runtime version skew from silently broadening historical limits or ignoring an explicit new limit.
+
 Starting a sandbox crosses a private process boundary. On Unix, launch JSON is passed through inherited descriptor 96, the parent watchdog uses descriptor 97, startup JSON uses descriptor 98, and the lifecycle lock uses descriptor 99. Windows uses a short-lived launch-config file and platform-specific startup plumbing. Detach acknowledgement bytes and graceful-shutdown signals are also part of this contract.
 
 Compatibility-sensitive elements include descriptor numbers, ownership and close-on-exec behavior, launch JSON field names and defaults, startup response shape, watchdog EOF meaning, signal meaning, detach acknowledgement, secret transport, and parent/child cleanup ordering.

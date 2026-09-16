@@ -97,10 +97,18 @@ pub struct RestoreControlArgs {
     #[cfg(feature = "net")]
     #[arg(long, value_name = "TOKENS")]
     pub net_rule: Vec<String>,
+    /// Deprecated alias for --max-tcp-connections.
+    #[cfg(feature = "net")]
+    #[arg(long, conflicts_with = "max_tcp_connections")]
+    pub max_connections: Option<usize>,
     /// Concurrent TCP limit; zero explicitly selects unlimited.
     #[cfg(feature = "net")]
     #[arg(long)]
-    pub max_connections: Option<usize>,
+    pub max_tcp_connections: Option<usize>,
+    /// Concurrent UDP session limit; zero explicitly selects unlimited.
+    #[cfg(feature = "net")]
+    #[arg(long)]
+    pub max_udp_connections: Option<usize>,
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -137,8 +145,11 @@ impl RestoreControlArgs {
             if let Some(policy) = self.network_policy()? {
                 builder = builder.network_policy(policy);
             }
-            if let Some(limit) = self.max_connections {
-                builder = builder.max_connections(limit);
+            if let Some(limit) = self.max_tcp_connections.or(self.max_connections) {
+                builder = builder.max_tcp_connections(limit);
+            }
+            if let Some(limit) = self.max_udp_connections {
+                builder = builder.max_udp_connections(limit);
             }
         }
         Ok(builder)
@@ -332,6 +343,47 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn restore_parses_independent_tcp_udp_limits_and_rejects_duplicate_tcp_aliases() {
+        for tcp_flag in ["--max-connections", "--max-tcp-connections"] {
+            let cli = TestCli::try_parse_from([
+                "restore",
+                "ready",
+                "--name",
+                "child",
+                tcp_flag,
+                "0",
+                "--max-udp-connections",
+                "7",
+            ])
+            .unwrap();
+            let controls = &cli.args.controls;
+            assert_eq!(
+                controls.max_tcp_connections.or(controls.max_connections),
+                Some(0)
+            );
+            assert_eq!(controls.max_udp_connections, Some(7));
+            assert!(controls.apply(Sandbox::restore("ready")).is_ok());
+        }
+        let defaults = TestCli::try_parse_from(["restore", "ready", "--name", "child"]).unwrap();
+        assert_eq!(defaults.args.controls.max_tcp_connections, None);
+        assert_eq!(defaults.args.controls.max_udp_connections, None);
+        assert!(
+            TestCli::try_parse_from([
+                "restore",
+                "ready",
+                "--name",
+                "child",
+                "--max-connections",
+                "1",
+                "--max-tcp-connections",
+                "2",
+            ])
+            .is_err()
+        );
     }
 
     #[cfg(feature = "net")]

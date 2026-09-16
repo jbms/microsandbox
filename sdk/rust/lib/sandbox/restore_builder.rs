@@ -117,9 +117,28 @@ impl RestoreBuilder {
     /// Set the destination host's concurrent TCP connection limit; zero explicitly means unlimited.
     /// The limit is applied before disk boot or full-restore network activation.
     #[cfg(feature = "net")]
-    pub fn max_connections(mut self, limit: usize) -> Self {
-        self.inner = self.inner.network(|network| network.max_connections(limit));
+    pub fn max_tcp_connections(mut self, limit: usize) -> Self {
+        self.inner = self
+            .inner
+            .network(|network| network.max_tcp_connections(limit));
         self
+    }
+
+    /// Set the destination host's concurrent UDP session limit; zero explicitly means unlimited.
+    /// The limit is applied before disk boot or full-restore network activation.
+    #[cfg(feature = "net")]
+    pub fn max_udp_connections(mut self, limit: usize) -> Self {
+        self.inner = self
+            .inner
+            .network(|network| network.max_udp_connections(limit));
+        self
+    }
+
+    /// Deprecated alias for [`Self::max_tcp_connections`].
+    #[cfg(feature = "net")]
+    #[deprecated(note = "use max_tcp_connections instead")]
+    pub fn max_connections(self, limit: usize) -> Self {
+        self.max_tcp_connections(limit)
     }
 
     /// Disable the network device for disk boot. Full restore rejects removal of a captured device.
@@ -373,29 +392,65 @@ mod tests {
         let restore = Sandbox::restore("saved")
             .name("child")
             .network_policy(NetworkPolicy::none())
-            .max_connections(8);
+            .max_tcp_connections(8)
+            .max_udp_connections(4);
         let network = restore.inner.config.local_network_config().unwrap();
         assert!(network.enabled);
         assert_eq!(
             serde_json::to_value(network.policy).unwrap(),
             serde_json::to_value(NetworkPolicy::none()).unwrap()
         );
-        assert_eq!(network.max_connections, Some(8.into()));
+        assert_eq!(network.max_tcp_connections, Some(8.into()));
+        assert_eq!(network.max_udp_connections, Some(4.into()));
         assert!(network.interface.mac.is_none());
         assert!(!restore.inner.config.restore_boot_overrides.security);
-        let unlimited = Sandbox::restore("saved").name("child").max_connections(0);
-        assert_eq!(unlimited.inner.config.spec.network.max_connections, Some(0));
+        let unlimited = Sandbox::restore("saved")
+            .name("child")
+            .max_tcp_connections(0)
+            .max_udp_connections(0);
+        assert_eq!(
+            unlimited.inner.config.spec.network.max_tcp_connections,
+            Some(0)
+        );
+        assert_eq!(
+            unlimited.inner.config.spec.network.max_udp_connections,
+            Some(0)
+        );
         assert_eq!(
             unlimited
                 .inner
                 .config
                 .local_network_config()
                 .unwrap()
-                .max_connections,
+                .max_tcp_connections,
+            Some(microsandbox_network::config::ConnectionLimit::Unlimited)
+        );
+        assert_eq!(
+            unlimited
+                .inner
+                .config
+                .local_network_config()
+                .unwrap()
+                .max_udp_connections,
             Some(microsandbox_network::config::ConnectionLimit::Unlimited)
         );
         let disabled = Sandbox::restore("saved").name("child").disable_network();
         assert!(!disabled.inner.config.spec.network.enabled);
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    #[allow(deprecated)]
+    fn destination_connection_limits_preserve_omission_and_tcp_alias() {
+        let defaults = Sandbox::restore("saved");
+        assert_eq!(defaults.inner.config.spec.network.max_tcp_connections, None);
+        assert_eq!(defaults.inner.config.spec.network.max_udp_connections, None);
+        let legacy = Sandbox::restore("saved").max_connections(0);
+        assert_eq!(
+            legacy.inner.config.spec.network.max_tcp_connections,
+            Some(0)
+        );
+        assert_eq!(legacy.inner.config.spec.network.max_udp_connections, None);
     }
 
     #[test]

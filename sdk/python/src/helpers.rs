@@ -202,6 +202,8 @@ pub(crate) fn restore_builder_from_args(
             "memory",
             "network_policy",
             "max_connections",
+            "max_tcp_connections",
+            "max_udp_connections",
             "disable_network",
             "security",
             "max_duration",
@@ -240,8 +242,31 @@ pub(crate) fn restore_builder_from_args(
             builder = builder.network_policy(policy);
         }
     }
-    if let Some(count) = extract_opt::<usize>(kwargs, "max_connections")? {
-        builder = builder.max_connections(count);
+    let legacy = extract_opt::<usize>(kwargs, "max_connections")?;
+    let tcp = extract_opt::<usize>(kwargs, "max_tcp_connections")?;
+    if legacy.is_some() && tcp.is_some() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "max_connections and max_tcp_connections are mutually exclusive",
+        ));
+    }
+    if legacy.is_some() {
+        PyModule::import(kwargs.py(), "warnings")?.call_method1(
+            "warn",
+            (
+                "max_connections is deprecated; use max_tcp_connections",
+                kwargs
+                    .py()
+                    .get_type::<pyo3::exceptions::PyDeprecationWarning>(),
+                2,
+            ),
+        )?;
+    }
+    // Omission preserves destination defaults; explicit zero requests unlimited sessions.
+    if let Some(count) = tcp.or(legacy) {
+        builder = builder.max_tcp_connections(count);
+    }
+    if let Some(count) = extract_opt::<usize>(kwargs, "max_udp_connections")? {
+        builder = builder.max_udp_connections(count);
     }
     if extract_opt::<bool>(kwargs, "disable_network")?.unwrap_or(false) {
         builder = builder.disable_network();
@@ -1509,8 +1534,18 @@ fn apply_network(
     }
 
     // Max connections.
-    if let Some(max) = extract_opt::<usize>(net, "max_connections")? {
-        builder = builder.network(|n| n.max_connections(max));
+    let legacy = extract_opt::<usize>(net, "max_connections")?;
+    let tcp = extract_opt::<usize>(net, "max_tcp_connections")?;
+    if legacy.is_some() && tcp.is_some() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "max_connections and max_tcp_connections are mutually exclusive",
+        ));
+    }
+    if let Some(max) = tcp.or(legacy) {
+        builder = builder.network(|n| n.max_tcp_connections(max));
+    }
+    if let Some(max) = extract_opt::<usize>(net, "max_udp_connections")? {
+        builder = builder.network(|n| n.max_udp_connections(max));
     }
 
     // Strict hostname policy.

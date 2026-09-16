@@ -102,10 +102,23 @@ impl JsRestoreBuilder {
         Ok(self)
     }
 
-    /// Cap destination host-side concurrent network connections.
+    /// @deprecated Use maxTcpConnections instead.
     #[napi(js_name = "maxConnections")]
     pub fn max_connections(&mut self, count: u32) -> Result<&Self> {
-        self.inner = Some(self.take_inner()?.max_connections(count as usize));
+        self.max_tcp_connections(count)
+    }
+
+    /// Cap destination host-side TCP connections; zero selects unlimited.
+    #[napi(js_name = "maxTcpConnections")]
+    pub fn max_tcp_connections(&mut self, count: u32) -> Result<&Self> {
+        self.inner = Some(self.take_inner()?.max_tcp_connections(count as usize));
+        Ok(self)
+    }
+
+    /// Cap destination host-side UDP sessions; zero selects unlimited.
+    #[napi(js_name = "maxUdpConnections")]
+    pub fn max_udp_connections(&mut self, count: u32) -> Result<&Self> {
+        self.inner = Some(self.take_inner()?.max_udp_connections(count as usize));
         Ok(self)
     }
 

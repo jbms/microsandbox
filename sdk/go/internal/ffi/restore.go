@@ -10,6 +10,8 @@ type RestoreOptions struct {
 	MemoryMiB                   *uint32              `json:"memory_mib,omitempty"`
 	NetworkPolicy               *CustomNetworkPolicy `json:"network_policy,omitempty"`
 	MaxConnections              *uint                `json:"max_connections,omitempty"`
+	MaxTCPConnections           *uint                `json:"max_tcp_connections,omitempty"`
+	MaxUDPConnections           *uint                `json:"max_udp_connections,omitempty"`
 	DisableNetwork              bool                 `json:"disable_network,omitempty"`
 	SecurityProfile             string               `json:"security_profile,omitempty"`
 	MaxDurationSecs             *uint64              `json:"max_duration_secs,omitempty"`

@@ -47,6 +47,8 @@ vi.mock("../../dist/internal/napi.js", () => {
         memory(value: number): this { native.controls("memory", value); return this; }
         networkPolicy(value: unknown): this { native.controls("networkPolicy", value); return this; }
         maxConnections(value: number): this { native.controls("maxConnections", value); return this; }
+        maxTcpConnections(value: number): this { native.controls("maxTcpConnections", value); return this; }
+        maxUdpConnections(value: number): this { native.controls("maxUdpConnections", value); return this; }
         disableNetwork(): this { native.controls("disableNetwork"); return this; }
         security(value: string): this { native.controls("security", value); return this; }
         maxDuration(value: number): this { native.controls("maxDuration", value); return this; }
@@ -99,14 +101,32 @@ describe("creation result lifecycle ownership", () => {
     it(`${method} retains explicit destination controls and zero limits`, async () => {
       const policy = { defaultEgress: "deny" as const, defaultIngress: "deny" as const, rules: [] };
       const builder = Sandbox.restore("baseline").name("destination")
-        .cpus(2).memory(512).networkPolicy(policy).maxConnections(0)
+        .cpus(2).memory(512).networkPolicy(policy).maxTcpConnections(0).maxUdpConnections(7)
         .disableNetwork().security("default").maxDuration(0).idleTimeout(0);
       if (method === "restore") await builder.restore();
       else await (await builder.restoreWithProgress()).awaitSandbox();
       expect(native.controls.mock.calls).toEqual([
-        ["cpus", 2], ["memory", 512], ["networkPolicy", policy], ["maxConnections", 0],
+        ["cpus", 2], ["memory", 512], ["networkPolicy", policy],
+        ["maxTcpConnections", 0], ["maxUdpConnections", 7],
         ["disableNetwork"], ["security", "default"], ["maxDuration", 0], ["idleTimeout", 0],
       ]);
+      expect(native.create).not.toHaveBeenCalled();
+    });
+    for (const tcpMethod of ["maxTcpConnections", "maxConnections"] as const) {
+      it(`${method} forwards ${tcpMethod} independently of an explicit unlimited UDP limit`, async () => {
+        const builder = Sandbox.restore("baseline").name("destination")
+          [tcpMethod](64).maxUdpConnections(0);
+        if (method === "restore") await builder.restore();
+        else await (await builder.restoreWithProgress()).awaitSandbox();
+        expect(native.controls.mock.calls).toEqual([[tcpMethod, 64], ["maxUdpConnections", 0]]);
+        expect(native.create).not.toHaveBeenCalled();
+      });
+    }
+    it(`${method} leaves omitted destination limits untouched`, async () => {
+      const builder = Sandbox.restore("baseline").name("destination");
+      if (method === "restore") await builder.restore();
+      else await (await builder.restoreWithProgress()).awaitSandbox();
+      expect(native.controls).not.toHaveBeenCalled();
       expect(native.create).not.toHaveBeenCalled();
     });
     for (const seed of [

@@ -18,9 +18,15 @@ type RestoreConfig struct {
 	CPUs      *uint8
 	MemoryMiB *uint32
 	// NetworkPolicy accepts only Rules, DefaultEgress, and DefaultIngress.
-	NetworkPolicy  *NetworkConfig
+	NetworkPolicy *NetworkConfig
+	// MaxConnections caps TCP connections.
+	// Deprecated: use MaxTCPConnections instead; specifying both is an error.
 	MaxConnections *uint
-	DisableNetwork bool
+	// MaxTCPConnections caps destination TCP connections; zero means unlimited.
+	MaxTCPConnections *uint
+	// MaxUDPConnections caps destination UDP relay sessions; zero means unlimited.
+	MaxUDPConnections *uint
+	DisableNetwork    bool
 	// Explicit guest security requires disk scope or SnapshotDiskOnly.
 	SecurityProfile SecurityProfile
 	// Nil omits a lifetime override; explicit zero requests immediate expiry.
@@ -77,9 +83,20 @@ func WithRestoreNetworkPolicy(policy *NetworkConfig) RestoreOption {
 	return func(o *RestoreConfig) { o.NetworkPolicy = policy }
 }
 
-// WithRestoreMaxConnections caps destination host-side concurrent connections.
+// WithRestoreMaxConnections caps destination host-side concurrent TCP connections.
+// Deprecated: use WithRestoreMaxTCPConnections instead; specifying both is an error.
 func WithRestoreMaxConnections(count uint) RestoreOption {
 	return func(o *RestoreConfig) { o.MaxConnections = &count }
+}
+
+// WithRestoreMaxTCPConnections caps destination TCP connections. Zero means unlimited.
+func WithRestoreMaxTCPConnections(count uint) RestoreOption {
+	return func(o *RestoreConfig) { o.MaxTCPConnections = &count }
+}
+
+// WithRestoreMaxUDPConnections caps destination UDP relay sessions. Zero means unlimited.
+func WithRestoreMaxUDPConnections(count uint) RestoreOption {
+	return func(o *RestoreConfig) { o.MaxUDPConnections = &count }
 }
 
 // WithRestoreDisableNetwork disables networking; full restore rejects removing a captured NIC.
@@ -104,6 +121,9 @@ func WithRestoreIdleTimeout(duration time.Duration) RestoreOption {
 }
 
 func validateRestoreConfig(config RestoreConfig) error {
+	if config.MaxConnections != nil && config.MaxTCPConnections != nil {
+		return fmt.Errorf("microsandbox: restore MaxConnections and MaxTCPConnections cannot both be specified")
+	}
 	for name, duration := range map[string]*time.Duration{
 		"max duration": config.MaxDuration, "idle timeout": config.IdleTimeout,
 	} {
@@ -163,7 +183,8 @@ func buildFFIRestoreOptions[T SnapshotSeed](snapshot T, config RestoreConfig) ff
 	return ffi.RestoreOptions{
 		Snapshot: reference, SnapshotReferenceKind: referenceKind,
 		CPUs: config.CPUs, MemoryMiB: config.MemoryMiB, NetworkPolicy: policy,
-		MaxConnections: config.MaxConnections, DisableNetwork: config.DisableNetwork,
+		MaxConnections: config.MaxConnections, MaxTCPConnections: config.MaxTCPConnections,
+		MaxUDPConnections: config.MaxUDPConnections, DisableNetwork: config.DisableNetwork,
 		SecurityProfile: string(config.SecurityProfile),
 		MaxDurationSecs: seconds(config.MaxDuration), IdleTimeoutSecs: seconds(config.IdleTimeout),
 		Forked: config.Forked, DiskOnly: config.SnapshotDiskOnly,

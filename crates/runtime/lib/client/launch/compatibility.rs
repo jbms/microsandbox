@@ -81,6 +81,15 @@ pub(super) fn decode(bytes: &[u8]) -> Result<LaunchConfig, String> {
                 "max_connections".into(),
                 Value::from(if multi_tenant { limit.min(256) } else { limit }),
             );
+            // Historical engines always used 256 UDP sessions, independently of
+            // their TCP setting. Do not broaden old SDK launches to today's defaults.
+            if config
+                .get("max_udp_connections")
+                .is_some_and(|value| !value.is_null())
+            {
+                return Err("UDP connection limits require the current launch contract".into());
+            }
+            config.insert("max_udp_connections".into(), Value::from(256));
         }
         if let Some(secrets) = network
             .pointer_mut("/config/secrets")

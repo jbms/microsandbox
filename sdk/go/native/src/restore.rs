@@ -25,7 +25,9 @@ struct RestoreOptions {
     memory_mib: Option<u32>,
     #[serde(default, deserialize_with = "deserialize_network_policy")]
     network_policy: Option<CustomNetworkPolicy>,
-    max_connections: Option<usize>,
+    #[serde(alias = "max_connections")]
+    max_tcp_connections: Option<usize>,
+    max_udp_connections: Option<usize>,
     #[serde(default)]
     disable_network: bool,
     security_profile: Option<String>,
@@ -99,8 +101,11 @@ fn builder(name: String, opts: &RestoreOptions) -> Result<RestoreBuilder, FfiErr
     if let Some(policy) = &opts.network_policy {
         builder = builder.network_policy(parse_custom_network_policy(policy, Vec::new())?);
     }
-    if let Some(count) = opts.max_connections {
-        builder = builder.max_connections(count);
+    if let Some(count) = opts.max_tcp_connections {
+        builder = builder.max_tcp_connections(count);
+    }
+    if let Some(count) = opts.max_udp_connections {
+        builder = builder.max_udp_connections(count);
     }
     if opts.disable_network {
         builder = builder.disable_network();
@@ -235,15 +240,53 @@ mod tests {
         .unwrap();
         assert_eq!(options.cpus, Some(2));
         assert_eq!(options.memory_mib, Some(512));
-        assert_eq!(options.max_connections, Some(0));
+        assert_eq!(options.max_tcp_connections, Some(0));
         assert_eq!(options.max_duration_secs, Some(0));
         assert_eq!(options.idle_timeout_secs, Some(0));
         assert!(builder("destination".into(), &options).is_ok());
     }
 
     #[test]
+    fn restore_connection_limits_preserve_omission_and_aliases() {
+        let omitted: RestoreOptions =
+            serde_json::from_value(serde_json::json!({"snapshot": "saved"})).unwrap();
+        assert_eq!(omitted.max_tcp_connections, None);
+        assert_eq!(omitted.max_udp_connections, None);
+
+        for name in ["max_connections", "max_tcp_connections"] {
+            for udp in [0, 7] {
+                let options: RestoreOptions = serde_json::from_value(serde_json::json!({
+                    "snapshot": "saved", name: 0, "max_udp_connections": udp
+                }))
+                .unwrap();
+                assert_eq!(options.max_tcp_connections, Some(0));
+                assert_eq!(options.max_udp_connections, Some(udp));
+                assert!(builder("destination".into(), &options).is_ok());
+            }
+        }
+
+        // Duplicate names must fail even when their values match, as they do
+        // at the create boundary; neither spelling silently wins.
+        for canonical in [0, 64] {
+            let value = serde_json::json!({
+                "snapshot": "saved", "max_connections": 0, "max_tcp_connections": canonical
+            });
+            assert!(serde_json::from_value::<RestoreOptions>(value).is_err());
+        }
+    }
+
+    #[test]
     fn restore_rejects_nested_boot_network_options() {
-        for field in ["tls", "dns", "ports", "ipv4_pool", "secrets"] {
+        for field in [
+            "tls",
+            "dns",
+            "ports",
+            "ipv4_pool",
+            "secrets",
+            "max_connections",
+            "max_tcp_connections",
+            "max_udp_connections",
+        ] {
             let mut policy = serde_json::json!({"default_egress":"deny", "rules":[]});
             policy[field] = serde_json::json!({});
             let value = serde_json::json!({"snapshot":"baseline", "network_policy":policy});

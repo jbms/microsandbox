@@ -258,16 +258,27 @@ fn legacy_connection_limits_keep_historical_budgets_and_refuse_ambiguous_zero() 
                 } else {
                     expected
                 };
+                let network = launch.network.unwrap();
                 assert_eq!(
-                    launch.network.unwrap().config().max_connections,
+                    network.config().max_tcp_connections,
                     Some(ConnectionLimit::from(expected)),
                 );
+                assert_eq!(network.config().max_udp_connections, Some(256.into()));
             }
         }
         for requested in [json!(0), json!(4097), json!(-1), json!("unlimited")] {
             let mut value = input.clone();
             value["network"] = json!({"max_connections": requested});
             assert!(decode(&value).is_err(), "{requested}");
+        }
+        for requested in [0, 1, 256] {
+            let mut value = input.clone();
+            value["network"] = json!({"max_udp_connections": requested});
+            assert!(
+                decode(&value)
+                    .unwrap_err()
+                    .contains("UDP connection limits")
+            );
         }
     }
 }
@@ -279,12 +290,18 @@ fn current_launch_keeps_new_connection_limit_semantics() {
 
     for requested in [None, Some(0), Some(4097)] {
         let mut value = serde_json::to_value(LaunchConfig::default()).unwrap();
-        value["network"] =
-            json!({"config": {"max_connections": requested}, "outbound_proxy": null});
+        value["network"] = json!({"config": {
+            "max_connections": requested, "max_udp_connections": requested
+        }, "outbound_proxy": null});
         let launch = decode(&value).unwrap();
+        let network = launch.network.unwrap();
         assert_eq!(
-            launch.network.unwrap().config().max_connections,
+            network.config().max_tcp_connections,
             requested.map(ConnectionLimit::from),
+        );
+        assert_eq!(
+            network.config().max_udp_connections,
+            requested.map(ConnectionLimit::from)
         );
     }
 }
@@ -297,7 +314,7 @@ fn resolved_network_preserves_policy_and_refuses_unavailable_features() {
         json!({"config":{"enabled":false,"max_connections":12},"outbound_proxy":null});
     let net = decode(&value).unwrap().network.unwrap();
     assert!(!net.config().enabled);
-    assert_eq!(net.config().max_connections, Some(12.into()));
+    assert_eq!(net.config().max_tcp_connections, Some(12.into()));
     value["network"]["outbound_proxy"] = json!({"secret":"secret-marker"});
     let err = decode(&value).unwrap_err();
     assert!(!err.contains("secret-marker"));

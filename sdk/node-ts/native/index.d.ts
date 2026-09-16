@@ -511,8 +511,12 @@ export declare class NetworkBuilder {
   interface(configure: (arg: InterfaceOverridesBuilder) => InterfaceOverridesBuilder): this
   /** Configure the default blocking action for secret placeholders. */
   secretViolationAction(action: string): this
-  /** Set the maximum number of concurrent connections. */
+  /** @deprecated Use maxTcpConnections instead. */
   maxConnections(max: number): this
+  /** Set the TCP connection cap; zero selects unlimited. */
+  maxTcpConnections(max: number): this
+  /** Set the UDP session cap; zero selects unlimited. Defaults to unlimited for single-tenant and 1024 for multi-tenant. */
+  maxUdpConnections(max: number): this
   /** Require hostname-based policy allows to use inspectable application authority. */
   strict(enabled: boolean): this
   /** Set the IPv4 pool used for per-sandbox /30 guest subnets. */
@@ -739,8 +743,12 @@ export declare class RestoreBuilder {
   networkPolicyJson(json: string): this
   /** Set host-side policy from the existing policy builder. */
   networkPolicyFromBuilder(builder: NetworkPolicyBuilder): this
-  /** Cap destination host-side concurrent network connections. */
+  /** @deprecated Use maxTcpConnections instead. */
   maxConnections(count: number): this
+  /** Cap destination host-side TCP connections; zero selects unlimited. */
+  maxTcpConnections(count: number): this
+  /** Cap destination host-side UDP sessions; zero selects unlimited. */
+  maxUdpConnections(count: number): this
   /** Disable networking; full restore rejects removal of a captured NIC. */
   disableNetwork(): this
   /** Set guest security for disk boot; explicit changes are rejected by full restore. */

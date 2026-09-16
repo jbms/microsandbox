@@ -3,6 +3,7 @@ package microsandbox
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -63,10 +64,63 @@ func TestRestoreOmittedControlsRemainAbsent(t *testing.T) {
 	}
 }
 
+func TestRestoreConnectionLimitsPreserveExplicitZero(t *testing.T) {
+	for _, tcp := range []struct {
+		name   string
+		field  string
+		option RestoreOption
+	}{
+		{"canonical", "max_tcp_connections", WithRestoreMaxTCPConnections(0)},
+		{"legacy", "max_connections", WithRestoreMaxConnections(0)},
+	} {
+		t.Run(tcp.name, func(t *testing.T) {
+			var config RestoreConfig
+			tcp.option(&config)
+			WithRestoreMaxUDPConnections(0)(&config)
+			if err := validateRestoreConfig(config); err != nil {
+				t.Fatal(err)
+			}
+			encoded, err := json.Marshal(buildFFIRestoreOptions("baseline", config))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got map[string]any
+			if err := json.Unmarshal(encoded, &got); err != nil {
+				t.Fatal(err)
+			}
+			if len(got) != 3 || got[tcp.field] != float64(0) || got["max_udp_connections"] != float64(0) {
+				t.Fatalf("connection limits lost or unexpected aliases emitted: %s", encoded)
+			}
+		})
+	}
+}
+
+func TestRestoreRejectsDuplicateTCPAliasesBeforeFFI(t *testing.T) {
+	// Matching values are also ambiguous: reject both spellings instead of
+	// letting option order silently select which limit reaches the runtime.
+	for _, canonical := range []uint{0, 64} {
+		var config RestoreConfig
+		WithRestoreMaxConnections(0)(&config)
+		WithRestoreMaxTCPConnections(canonical)(&config)
+		if err := validateRestoreConfig(config); err == nil || !strings.Contains(err.Error(), "MaxConnections and MaxTCPConnections") {
+			t.Fatalf("duplicate TCP aliases must fail validation: %v", err)
+		}
+		if _, err := RestoreSandbox(context.Background(), "baseline", "child", WithRestoreConfig(config)); err == nil {
+			t.Fatal("restore must reject duplicate TCP aliases before FFI")
+		}
+		_, result := RestoreSandboxWithProgress(context.Background(), "baseline", "child", WithRestoreConfig(config))
+		if outcome := <-result; outcome.Err == nil {
+			t.Fatal("progress restore must reject duplicate TCP aliases before FFI")
+		}
+	}
+}
+
 func TestRestoreRejectsBroadNetworkOptionsBeforeFFI(t *testing.T) {
+	zero := uint(0)
 	for _, policy := range []*NetworkConfig{
 		{TLS: &TLSConfig{}}, {DNS: &DNSConfig{}}, {Ports: map[uint16]uint16{8080: 80}},
 		{IPv4Pool: "10.0.0.0/8"}, {DenyDomains: []string{"example.com"}},
+		{MaxConnections: &zero}, {MaxTCPConnections: &zero}, {MaxUDPConnections: &zero},
 	} {
 		config := RestoreConfig{NetworkPolicy: policy}
 		if err := validateRestoreConfig(config); err == nil {

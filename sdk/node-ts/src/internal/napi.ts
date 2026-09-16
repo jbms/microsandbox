@@ -267,7 +267,12 @@ export interface NapiRestoreBuilderSetters {
   memory(mib: number): this;
   /** Host policy only: does not configure DNS, TLS, or guest bootstrap. */
   networkPolicy(policy: NetworkPolicy | NapiNetworkPolicyBuilder): this;
+  /** @deprecated Use maxTcpConnections instead. */
   maxConnections(count: number): this;
+  /** Zero selects unlimited; omission retains destination defaults. */
+  maxTcpConnections(count: number): this;
+  /** Zero selects unlimited; omission retains destination defaults. */
+  maxUdpConnections(count: number): this;
   /** Full execution restore rejects removing a captured NIC. */
   disableNetwork(): this;
   /** Requires disk scope or diskOnly(); full execution rejects even explicit default. */
@@ -1092,7 +1097,10 @@ export interface NapiNetworkBuilder {
     configure: (b: NapiInterfaceOverridesBuilder) => NapiInterfaceOverridesBuilder,
   ): this;
   secretViolationAction(action: string): this;
+  /** @deprecated Use maxTcpConnections instead. */
   maxConnections(max: number): this;
+  maxTcpConnections(max: number): this;
+  maxUdpConnections(max: number): this;
   strict(enabled: boolean): this;
   ipv4Pool(pool: string): this;
   ipv6Pool(pool: string): this;

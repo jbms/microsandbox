@@ -449,7 +449,7 @@ describe("SandboxBuilder.build", () => {
     const cfg = await Sandbox.builder("x")
       .image("alpine")
       .proxy((p) => p.socks5("127.0.0.1:1080"))
-      .network((n) => n.maxConnections(64))
+      .network((n) => n.maxTcpConnections(64))
       .build();
 
     expect(cfg.network).toMatchObject({
@@ -457,7 +457,7 @@ describe("SandboxBuilder.build", () => {
         protocol: "socks5",
         address: "127.0.0.1:1080",
       },
-      maxConnections: 64,
+      maxTcpConnections: 64,
     });
   });
 
@@ -936,5 +936,38 @@ describe("Stdin factory", () => {
     if (bytes.kind === "bytes") {
       expect(new TextDecoder().decode(bytes.data)).toBe("hello");
     }
+  });
+});
+
+describe("TCP connection limit aliases", () => {
+  it("keeps omitted limits distinct from explicit unlimited", () => {
+    const omitted = new NetworkBuilder().build();
+    expect(omitted.maxTcpConnections).toBeNull();
+    expect(omitted.maxUdpConnections).toBeNull();
+    const explicit = new NetworkBuilder().maxTcpConnections(64).maxUdpConnections(0).build();
+    expect(explicit.maxTcpConnections).toBe(64);
+    expect(explicit.maxUdpConnections).toBe(0);
+  });
+
+  it("keeps the deprecated builder and read accessor TCP-only", () => {
+    const config = new NetworkBuilder().maxConnections(0).maxUdpConnections(7).build();
+    expect(config.maxTcpConnections).toBe(0);
+    expect(config.maxConnections).toBe(0);
+    expect(config.maxUdpConnections).toBe(7);
+  });
+
+  it("uses the last builder value regardless of spelling", () => {
+    expect(new NetworkBuilder().maxConnections(0).maxTcpConnections(64).build().maxTcpConnections)
+      .toBe(64);
+    expect(new NetworkBuilder().maxTcpConnections(64).maxConnections(0).build().maxTcpConnections)
+      .toBe(0);
+  });
+
+  it("exposes both read names on a sandbox configuration", async () => {
+    const config = await Sandbox.builder("x").image("alpine")
+      .network(n => n.maxTcpConnections(64).maxUdpConnections(7)).build();
+    expect(config.network.maxTcpConnections).toBe(64);
+    expect(config.network.maxConnections).toBe(64);
+    expect(config.network.maxUdpConnections).toBe(7);
   });
 });
