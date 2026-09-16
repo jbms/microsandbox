@@ -37,11 +37,11 @@ def pair(root: Path, marker: str = "runtime") -> Path:
 def runtime_fixture(tmp_path):
     # Copy the Python layer but reuse the freshly built extension. Each child
     # imports a real wheel layout, so package auto-registration is exercised.
-    import microsandbox
+    from microsandbox import __file__ as microsandbox_file
 
     package = tmp_path / "microsandbox"
     shutil.copytree(
-        Path(microsandbox.__file__).parent,
+        Path(microsandbox_file).parent,
         package,
         ignore=shutil.ignore_patterns("*.so", "*.pyd", "__pycache__", "_bundled"),
     )

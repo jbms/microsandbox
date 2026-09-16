@@ -6,7 +6,14 @@ from pathlib import Path
 
 import pytest
 
-from microsandbox import BranchOutcome, Image, InvalidConfigError, Sandbox, Snapshot
+from microsandbox import (
+    BranchOutcome,
+    Image,
+    InvalidConfigError,
+    Sandbox,
+    SandboxNotFoundError,
+    Snapshot,
+)
 
 
 @pytest.mark.skipif(os.environ.get("MSB_COW_LIVE") != "1", reason="requires matching live bundle")
@@ -74,7 +81,9 @@ async def test_cancel_batch_releases_staging_and_preserves_completed_children():
                 first = await Sandbox.get(names[0])
                 if str(first.status) == "running":
                     break
-            except Exception:
+            except SandboxNotFoundError:
+                # The batch may not have registered its first child yet. Retry after
+                # the shared delay below, without hiding unrelated lookup failures.
                 pass
             await asyncio.sleep(0.01)
         else:
