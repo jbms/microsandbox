@@ -29,7 +29,7 @@ class RestoreResourceIntentTests(unittest.TestCase):
         self.created = []
         self.rejected = set()
         self.cleanup_errors = {}
-        self.failed_create = None
+        self.failed_destination = None
         contexts = contextlib.ExitStack()
         self.addCleanup(contexts.close)
         contexts.enter_context(contextlib.redirect_stdout(io.StringIO()))
@@ -55,14 +55,29 @@ class RestoreResourceIntentTests(unittest.TestCase):
 
         self.assertEqual(kwargs["timeout"], 180)
         code, stdout, stderr = 0, "", ""
-        if command[1] == "create":
+        if command[1] in ("create", "restore"):
             name = command[command.index("--name") + 1]
             self.created.append(name)
-            if name == self.failed_create:
-                code, stderr = 1, "original create failure"
-            elif name.rsplit("-", 1)[-1] in ("smaller", "larger", "cpus", "flag"):
-                self.rejected.add(name)
-                code, stderr = 1, "captured CPU and memory geometry"
+            if command[1] == "create":
+                self.assertEqual(name, "source")
+                self.assertNotIn("--from-snapshot", command)
+            else:
+                self.assertIn(command[2], ("source:saved", str(self.output / "saved.msb")))
+                self.assertNotIn("--conf", command)
+                # Model geometry admission from the actual dedicated-restore flags,
+                # not case-name suffixes, so new spellings cannot bypass this check.
+                def option(*flags):
+                    return next((command[command.index(flag) + 1]
+                                 for flag in flags if flag in command), None)
+
+                if "--disk-only" not in command and (
+                    option("--cpus", "-c") not in (None, "2")
+                    or option("--memory", "-m") not in (None, "512M")
+                ):
+                    self.rejected.add(name)
+                    code, stderr = 1, "captured CPU and memory geometry"
+            if name == self.failed_destination:
+                code, stderr = 1, "original restore failure"
         elif command[1] == "inspect":
             name = command[2]
             if name in self.rejected:
@@ -98,6 +113,8 @@ class RestoreResourceIntentTests(unittest.TestCase):
         report = self.report()
         self.assertTrue(report["success"])
         self.assertEqual(len(self.created), 30)
+        self.assertEqual(len(self.rejected), 16)
+        self.assertEqual(sum(row["argv"][1] == "restore" for row in report["rows"]), 29)
         self.assert_all_cleanup_attempted(report)
         self.assertEqual(report["cleanup"][0], {
             "name": "disk-only", "exit": "timeout", "timeout_seconds": 30,
@@ -106,17 +123,17 @@ class RestoreResourceIntentTests(unittest.TestCase):
         self.assertEqual(report["cleanup"][-1], {"name": "source", "exit": 0, "stderr": ""})
 
     def test_cleanup_timeout_preserves_original_matrix_failure_and_report(self):
-        self.failed_create = "installed-eager-absent"
-        self.cleanup_errors[self.failed_create] = subprocess.TimeoutExpired(
-            ["fake-msb", "stop", self.failed_create], 30, stderr="still stopping",
+        self.failed_destination = "installed-eager-absent"
+        self.cleanup_errors[self.failed_destination] = subprocess.TimeoutExpired(
+            ["fake-msb", "stop", self.failed_destination], 30, stderr="still stopping",
         )
-        with self.assertRaisesRegex(AssertionError, "installed-eager-absent: original create failure"):
+        with self.assertRaisesRegex(AssertionError, "installed-eager-absent: original restore failure"):
             runpy.run_path(str(SCRIPT), run_name="__main__")
         report = self.report()
         self.assertFalse(report["success"])
-        self.assertEqual(self.created, ["source", self.failed_create])
+        self.assertEqual(self.created, ["source", self.failed_destination])
         self.assert_all_cleanup_attempted(report)
-        self.assertEqual(report["rows"][-1]["case"], self.failed_create)
+        self.assertEqual(report["rows"][-1]["case"], self.failed_destination)
         self.assertEqual(report["rows"][-1]["exit"], 1)
         self.assertEqual(report["cleanup"][0]["exit"], "timeout")
         self.assertEqual(report["cleanup"][0]["stderr"], "still stopping")
