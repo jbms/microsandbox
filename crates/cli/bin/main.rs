@@ -1006,6 +1006,39 @@ mod sandbox_command_tests {
     }
 
     #[test]
+    fn restore_preserves_geometry_controls_through_all_public_forms() {
+        for prefix in [&[][..], &["sandbox"][..], &["sbx"][..]] {
+            for mode in [&[][..], &["--forked"][..], &["--disk-only"][..]] {
+                for (controls, cpus, memory) in [
+                    (&[][..], None, None),
+                    (&["--cpus", "2"][..], Some(2), None),
+                    (&["--memory", "512M"][..], None, Some("512M")),
+                    (
+                        &["--cpus", "2", "--memory", "512M"][..],
+                        Some(2),
+                        Some("512M"),
+                    ),
+                    (&["-c", "2", "-m", "512M"][..], Some(2), Some("512M")),
+                ] {
+                    let args =
+                        [&["restore", "saved", "--name", "child"][..], mode, controls].concat();
+                    let restored = parse_sandbox(prefix, &args);
+                    assert!(!restored.is_resident_control());
+                    let sandbox::SandboxCommands::Restore(restored) = restored else {
+                        panic!("expected restore for {prefix:?} {args:?}");
+                    };
+                    // Parsing preserves explicit intent. Disk boot can resize; full restore
+                    // checks these values against captured geometry after resolving the snapshot.
+                    assert_eq!(restored.controls.cpus, cpus);
+                    assert_eq!(restored.controls.memory.as_deref(), memory);
+                    assert_eq!(restored.forked, mode.contains(&"--forked"));
+                    assert_eq!(restored.disk_only, mode.contains(&"--disk-only"));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn restore_rejects_boot_inputs_and_uses_the_creation_executor() {
         for prefix in [&[][..], &["sandbox"][..], &["sbx"][..]] {
             let restored = parse_sandbox(prefix, &["restore", "saved", "--name", "child"]);
@@ -1013,8 +1046,8 @@ mod sandbox_command_tests {
             assert!(!restored.is_resident_control());
             for extra in [
                 &["--forked", "--disk-only"][..],
-                &["--memory", "512M"][..],
-                &["--cpus", "2"][..],
+                &["--conf", "sandbox.yaml"][..],
+                &["--entrypoint", "sh"][..],
                 &["--", "sh"][..],
                 &["--replace"][..],
             ] {

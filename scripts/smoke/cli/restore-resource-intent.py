@@ -72,25 +72,24 @@ try:
     descriptor_hash = hashlib.sha256((member / "snapshot.json").read_bytes()).hexdigest()
     archive = root / "saved.msb"
     run("save", "snapshot", "save", member, archive)
-    configs = {
-        "absent": "{}\n",
-        "matching": "cpus: 2\nmemory: 512M\n",
-        "smaller": "memory: 128M\n",
-        "larger": "memory: 1G\n",
-        "cpus": "cpus: 1\n",
+    # Dedicated restore accepts explicit geometry controls, not create-time config files.
+    cases = {
+        "absent": [],
+        "matching": ["--cpus", "2", "--memory", "512M"],
+        "smaller": ["--memory", "128M"],
+        "larger": ["--memory", "1G"],
+        "cpus": ["--cpus", "1"],
+        "short-memory": ["-m", "128M"],
     }
-    for name, text in configs.items():
-        (root / (name + ".yaml")).write_text(text)
 
     for storage, source in (("installed", "source:saved"), ("archive", archive)):
         for mode in ("eager", "forked"):
             flags = ["--forked"] if mode == "forked" else []
-            for case in (*configs, "flag"):
+            for case, options in cases.items():
                 name = f"{storage}-{mode}-{case}"
                 names.append(name)
-                options = ["--memory", "128M"] if case == "flag" else ["--conf", root / (case + ".yaml")]
                 rejected = case not in ("absent", "matching")
-                result = run(name, "create", "--name", name, "--from-snapshot", source,
+                result = run(name, "restore", source, "--name", name,
                              *flags, *options, fail=rejected)
                 if rejected:
                     assert "captured CPU and memory geometry" in result.stderr, result.stderr
@@ -102,14 +101,14 @@ try:
             # A later valid restore must still work after the rejected attempts.
             name = f"{storage}-{mode}-recovery"
             names.append(name)
-            run(name, "create", "--name", name, "--from-snapshot", source, *flags)
+            run(name, "restore", source, "--name", name, *flags)
             verify_child(name)
             run(name + "-stop", "stop", name)
 
     # The guard is specific to resumed CPU/RAM, not disk-only fresh boots.
     names.append("disk-only")
-    run("disk-only", "create", "--name", "disk-only", "--from-snapshot", "source:saved",
-        "--disk-only", "--conf", root / "smaller.yaml")
+    run("disk-only", "restore", "source:saved", "--name", "disk-only",
+        "--disk-only", "--memory", "128M")
     verify_child("disk-only", ram=False, memory=128)
     assert hashlib.sha256((member / "snapshot.json").read_bytes()).hexdigest() == descriptor_hash
     verify_child("source")

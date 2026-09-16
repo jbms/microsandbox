@@ -548,61 +548,6 @@ pub fn format_rfc3339_datetime(s: &str) -> Result<String, chrono::ParseError> {
 }
 
 //--------------------------------------------------------------------------------------------------
-// Tests
-//--------------------------------------------------------------------------------------------------
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn parse_size_bytes_accepts_raw_bytes_and_binary_suffixes() {
-        assert_eq!(super::parse_size_bytes("1048576").unwrap(), 1024 * 1024);
-        assert_eq!(super::parse_size_bytes("512K").unwrap(), 512 * 1024);
-        assert_eq!(super::parse_size_bytes("1M").unwrap(), 1024 * 1024);
-        assert_eq!(
-            super::parse_size_bytes("2G").unwrap(),
-            2 * 1024 * 1024 * 1024
-        );
-        assert_eq!(
-            super::parse_size_bytes("2g").unwrap(),
-            2 * 1024 * 1024 * 1024
-        );
-
-        assert!(super::parse_size_bytes("1.5M").is_err());
-        assert!(super::parse_size_bytes("abc").is_err());
-        assert!(super::parse_size_bytes(&format!("{}G", u64::MAX)).is_err());
-    }
-
-    #[test]
-    fn json_datetime_uses_rfc3339_utc() {
-        let dt = chrono::DateTime::parse_from_rfc3339("2026-05-31T09:09:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-
-        assert_eq!(
-            super::format_json_datetime(&dt),
-            "2026-05-31T09:09:00+00:00"
-        );
-    }
-
-    #[test]
-    fn display_datetime_uses_local_timezone() {
-        let dt = chrono::DateTime::parse_from_rfc3339("2026-05-31T09:09:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        let expected = dt
-            .with_timezone(&chrono::Local)
-            .format("%Y-%m-%d %H:%M:%S")
-            .to_string();
-
-        assert_eq!(super::format_datetime(&dt), expected);
-        assert_eq!(
-            super::format_rfc3339_datetime("2026-05-31T09:09:00Z").unwrap(),
-            expected
-        );
-    }
-}
-
-//--------------------------------------------------------------------------------------------------
 // Types: Pull Progress Display
 //--------------------------------------------------------------------------------------------------
 
@@ -848,5 +793,60 @@ impl PullProgressDisplay {
     /// Clear all ephemeral progress output from the terminal.
     pub fn finish(self) {
         let _ = self.mp.clear();
+    }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Tests
+//--------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn parse_size_bytes_accepts_raw_bytes_and_binary_suffixes() {
+        assert_eq!(super::parse_size_bytes("1048576").unwrap(), 1024 * 1024);
+        assert_eq!(super::parse_size_bytes("512K").unwrap(), 512 * 1024);
+        assert_eq!(super::parse_size_bytes("1M").unwrap(), 1024 * 1024);
+        assert_eq!(
+            super::parse_size_bytes("2G").unwrap(),
+            2 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            super::parse_size_bytes("2g").unwrap(),
+            2 * 1024 * 1024 * 1024
+        );
+
+        assert!(super::parse_size_bytes("1.5M").is_err());
+        assert!(super::parse_size_bytes("abc").is_err());
+        assert!(super::parse_size_bytes(&format!("{}G", u64::MAX)).is_err());
+    }
+
+    #[test]
+    fn json_datetime_uses_rfc3339_utc() {
+        let dt = chrono::DateTime::parse_from_rfc3339("2026-05-31T09:09:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        assert_eq!(
+            super::format_json_datetime(&dt),
+            "2026-05-31T09:09:00+00:00"
+        );
+    }
+
+    #[test]
+    fn display_datetime_uses_local_timezone() {
+        let dt = chrono::DateTime::parse_from_rfc3339("2026-05-31T09:09:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let expected = dt
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+
+        assert_eq!(super::format_datetime(&dt), expected);
+        assert_eq!(
+            super::format_rfc3339_datetime("2026-05-31T09:09:00Z").unwrap(),
+            expected
+        );
     }
 }
