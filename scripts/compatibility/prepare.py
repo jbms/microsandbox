@@ -40,6 +40,7 @@ def prepare(args):
         sdk = output / generation
         sdk.mkdir()
         record = dict(version=version, generation=generation)
+        legacy = tuple(map(int, version.split('.')[:2])) < (0, 7)
         if args.language == "python":
             if generation == "candidate":
                 wheels = list((artifacts / "python").glob("*.whl"))
@@ -69,11 +70,15 @@ def prepare(args):
                 run(["npm", "install", "--ignore-scripts", "--omit=dev"], app)
                 native = app / "node_modules/@superradcompany/microsandbox-linux-x64-gnu/microsandbox.linux-x64-gnu.node"
             shutil.copy2(source / "scripts/compatibility/scenarios/node.cjs", app / "scenario.cjs")
+            shutil.copy2(source / "scripts/compatibility/scenarios/lifecycle.cjs", app / "lifecycle.cjs")
             record["native_hash"] = sha256(native)
         elif args.language == "go":
             app = sdk / "app"
             app.mkdir()
             shutil.copy2(source / "scripts/compatibility/scenarios/go/main.go", app / "main.go")
+            shutil.copy2(source / "scripts/compatibility/scenarios/lifecycle.go", app / "lifecycle.go")
+            if legacy:
+                shutil.copy2(app / "lifecycle.go", app / "main.go")
             module = "github.com/superradcompany/microsandbox/sdk/go"
             mod = f"module compatibility-fixture\n\ngo 1.24\n\nrequire {module} v{version}\n"
             if generation == "candidate":
@@ -84,7 +89,9 @@ def prepare(args):
                          else baseline / GO_FFI, ffi)
             env = dict(os.environ, CGO_ENABLED="1", GOWORK="off", MICROSANDBOX_FFI_PATH=str(ffi))
             run(["go", "mod", "tidy"], app, env)
-            run(["go", "build", "-tags", "microsandbox_ffi_path", "-o", sdk / "scenario", "."], app, env)
+            # Named source files avoid compiling two independent main functions together.
+            run(["go", "build", "-tags", "microsandbox_ffi_path", "-o", sdk / "scenario", "main.go"], app, env)
+            run(["go", "build", "-tags", "microsandbox_ffi_path", "-o", sdk / "lifecycle", "lifecycle.go"], app, env)
             # Keep dependency provenance, not the candidate's absolute replace path.
             metadata = subprocess.check_output(["go", "list", "-m", "-json", module], cwd=app, env=env, text=True)
             (sdk / "dependency.json").write_text(metadata)
@@ -97,16 +104,25 @@ def prepare(args):
         elif args.language == "rust":
             app = sdk / "app"
             copy_tree(source / "scripts/compatibility/scenarios/rust", app)
+            shutil.copy2(source / "scripts/compatibility/scenarios/lifecycle.rs", app / "bin/lifecycle.rs")
+            if legacy:
+                shutil.copy2(app / "bin/lifecycle.rs", app / "bin/main.rs")
             manifest_path = app / "Cargo.toml"
             template = manifest_path.read_text()
+            template += '\n[[bin]]\nname = "lifecycle"\npath = "bin/lifecycle.rs"\n'
             # The fixture template carries a marker dependency for substitution.
             dependency = f'path = "{source / "sdk/rust"}"' if generation == "candidate" else f'version = "={version}"'
+            features = '["net", "prebuilt"]' if legacy else '["local", "net"]'
             template, replaced = re.subn(r'microsandbox = \{[^\n]+\}',
-                f'microsandbox = {{ {dependency}, default-features = false, features = ["local", "net"] }}', template)
+                f'microsandbox = {{ {dependency}, default-features = false, features = {features} }}', template)
             if replaced != 1:
                 raise ValueError("fixture must declare one microsandbox dependency")
             manifest_path.write_text(template)
             env = dict(os.environ, CARGO_TARGET_DIR=str(output / "rust-target"))
+            # Old SDKs embed their released agentd. Never borrow a candidate
+            # payload through an ambient build override in a baseline build.
+            if generation == "released":
+                env.pop("MSB_AGENTD_PATH", None)
             if generation == "candidate":
                 shutil.copy2(source / "Cargo.lock", app / "Cargo.lock")
             run(["cargo", "build", "--release", "--manifest-path", manifest_path], app, env)
@@ -125,6 +141,7 @@ def prepare(args):
             (sdk / "dependency.json").write_text(json.dumps(core[0], indent=2) + "\n")
             binary_name = tomllib.loads(template)["package"]["name"]
             shutil.copy2(output / "rust-target/release" / binary_name, sdk / "scenario")
+            shutil.copy2(output / "rust-target/release/lifecycle", sdk / "lifecycle")
         elif args.language == "ruby":
             if generation == "candidate":
                 # This patch is confined to this build checkout and never applied

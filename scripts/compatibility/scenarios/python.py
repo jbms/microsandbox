@@ -126,7 +126,7 @@ def validate_config(config, name, mounts, denied):
     require(config["image"]["Oci"]["root_disk"] == {"kind": "managed", "size_mib": 128},
             "persistent root disk configuration changed")
     environment = {entry["key"]: entry["value"] for entry in config["env"]}
-    require(environment.get("MSB_COMPAT_MARKER") == MARKER, "environment configuration was lost")
+    require(environment.get("COMPAT_MARKER") == MARKER, "environment configuration was lost")
     configured_mounts = config["mounts"]
     require(len(configured_mounts) == len(mounts), "mount count changed")
     require({mount["guest"] for mount in configured_mounts} == set(mounts), "mount paths changed")
@@ -191,7 +191,7 @@ async def suite():
             options = {"network": sdk.Network.none()} if denied else {}
             sandbox = await sdk.Sandbox.create(
                 name, image=sdk.Image.oci(os.environ["MSB_COMPAT_IMAGE"], root_disk=128),
-                memory=256, cpus=1, max_duration=300, env={"MSB_COMPAT_MARKER": MARKER},
+                memory=256, cpus=1, max_duration=300, env={"COMPAT_MARKER": MARKER},
                 volumes={mount: sdk.Volume.tmpfs(size_mib=8) for mount in mounts}, **options,
             )
             verify_runtime(name)
@@ -207,7 +207,7 @@ async def suite():
 
             require(await output(sandbox, "sh", ["-c", "printf exec-ok; exit 7"], code=7) == "exec-ok",
                     "exec output was lost")
-            require(await output(sandbox, "sh", ["-c", 'printf %s "$MSB_COMPAT_MARKER"']) == MARKER,
+            require(await output(sandbox, "sh", ["-c", 'printf %s "$COMPAT_MARKER"']) == MARKER,
                     "guest environment was lost")
             await output(sandbox, "sh", ["-ec", f"printf %s {MARKER} > /compat-marker"])
             for mount in mounts:
@@ -252,7 +252,7 @@ async def suite():
             verify_runtime(name)
             require(await output(sandbox, "cat", ["/compat-marker"]) == MARKER,
                     "stop/start lost the persistent root marker")
-            require(await output(sandbox, "sh", ["-c", 'printf %s "$MSB_COMPAT_MARKER"']) == MARKER,
+            require(await output(sandbox, "sh", ["-c", 'printf %s "$COMPAT_MARKER"']) == MARKER,
                     "stop/start lost the environment")
             for mount in mounts:
                 await output(sandbox, "test", ["!", "-e", f"{mount}/marker"])

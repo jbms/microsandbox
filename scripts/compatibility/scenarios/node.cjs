@@ -113,7 +113,7 @@ function validateConfig(config, name, mounts, denied) {
   assert.equal(config.resources.memory_mib, 256, "memory configuration was lost");
   assert.equal(config.resources.cpus, 1, "CPU configuration was lost");
   assert.deepEqual(config.image.Oci.root_disk, { kind: "managed", size_mib: 128 });
-  assert.equal(Object.fromEntries(config.env.map(({ key, value }) => [key, value])).MSB_COMPAT_MARKER,
+  assert.equal(Object.fromEntries(config.env.map(({ key, value }) => [key, value])).COMPAT_MARKER,
     marker, "environment configuration was lost");
   assert.equal(config.mounts.length, mounts.length, "mount count changed");
   assert.deepEqual(config.mounts.map((mount) => mount.guest).sort(), [...mounts].sort());
@@ -181,7 +181,7 @@ async function suite() {
       const name = `${prefix}-${index}`;
       const mounts = Array.from({ length: count }, (_, number) => `/compat-tmpfs-${number}`);
       owned.add(name);
-      let options = builder(name).env("MSB_COMPAT_MARKER", marker);
+      let options = builder(name).env("COMPAT_MARKER", marker);
       if (denied) options = options.network((network) => network.policy(sdk.NetworkPolicy.none()));
       for (const mount of mounts) options = options.volume(mount, (volume) => volume.tmpfs().size(8));
       let sandbox = await options.create();
@@ -197,7 +197,7 @@ async function suite() {
       checkpoint("create-and-shared-cli-catalog", { sandbox: name, id: handle.id, config });
 
       assert.equal(await output(sandbox, "sh", ["-c", "printf exec-ok; exit 7"], 7), "exec-ok");
-      assert.equal(await output(sandbox, "sh", ["-c", 'printf %s "$MSB_COMPAT_MARKER"']), marker);
+      assert.equal(await output(sandbox, "sh", ["-c", 'printf %s "$COMPAT_MARKER"']), marker);
       await output(sandbox, "sh", ["-ec", `printf %s ${marker} > /compat-marker`]);
       for (const mount of mounts) {
         assert.equal((await output(sandbox, "stat", ["-f", "-c", "%T", mount])).trim(), "tmpfs");
@@ -240,7 +240,7 @@ async function suite() {
       verifyRuntime(name);
       assert.equal(await output(sandbox, "cat", ["/compat-marker"]), marker,
         "stop/start lost the persistent root marker");
-      assert.equal(await output(sandbox, "sh", ["-c", 'printf %s "$MSB_COMPAT_MARKER"']), marker,
+      assert.equal(await output(sandbox, "sh", ["-c", 'printf %s "$COMPAT_MARKER"']), marker,
         "stop/start lost the environment");
       for (const mount of mounts) await output(sandbox, "test", ["!", "-e", `${mount}/marker`]);
       checkpoint("restart-persistence", { sandbox: name, tmpfs_reset: true });

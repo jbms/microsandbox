@@ -48,11 +48,11 @@ def lifecycle(report)
   begin
     sandbox = Microsandbox::Sandbox.create(
       name, image: ENV.fetch("MSB_COMPAT_IMAGE"), memory: 256, cpus: 1,
-      env: { "MSB_COMPAT_MARKER" => marker }
+      env: { "COMPAT_MARKER" => marker }
     )
     report[:passed] << "tmpfs-0/create"
     verify_runtime(report, name)
-    check_output(sandbox.exec("/bin/sh", ["-c", 'printf "%s" "$MSB_COMPAT_MARKER"']), marker)
+    check_output(sandbox.exec("/bin/sh", ["-c", 'printf "%s" "$COMPAT_MARKER"']), marker)
     report[:passed] << "tmpfs-0/exec-env"
     # A root-disk path is persistent even when the image mounts /tmp as tmpfs.
     sandbox.fs.write("/compat-persistent.txt", marker)

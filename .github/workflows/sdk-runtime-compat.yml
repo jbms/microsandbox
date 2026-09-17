@@ -8,15 +8,18 @@ permissions:
 
 jobs:
   baseline:
-    name: Pin published compatibility baseline
+    name: Pin published compatibility baselines
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
+    outputs:
+      versions: ${{ steps.baselines.outputs.versions }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Resolve and verify released runtime
+        id: baselines
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/compatibility/baseline.py --output compatibility-baseline
+        run: python3 scripts/compatibility/baseline.py --matrix --output compatibility-baseline
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: compatibility-baseline
@@ -25,13 +28,14 @@ jobs:
           retention-days: 3
 
   prepare:
-    name: Prepare ${{ matrix.language }} SDK pair
+    name: Prepare ${{ matrix.version }} ${{ matrix.language }} SDK pair
     needs: baseline
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
+        version: ${{ fromJson(needs.baseline.outputs.versions) }}
         language: [rust, python, node, go, ruby]
     env:
       CARGO_INCREMENTAL: "0"
@@ -97,21 +101,23 @@ jobs:
           python3 scripts/compatibility/prepare.py \
             --language '${{ matrix.language }}' \
             --workspace "$GITHUB_WORKSPACE" \
-            --baseline compatibility-baseline \
+            --baseline 'compatibility-baseline/${{ matrix.version }}' \
             --artifacts compatibility-artifacts \
             --output compatibility-payload
           tar -czf compatibility-payload.tar.gz --exclude=./rust-target -C compatibility-payload .
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: compatibility-sdk-${{ matrix.language }}
+          name: compatibility-sdk-${{ matrix.version }}-${{ matrix.language }}
           path: compatibility-payload.tar.gz
           if-no-files-found: error
           compression-level: 0
           retention-days: 3
 
   live:
-    name: Live ${{ matrix.language }} cross-version compatibility
-    needs: prepare
+    name: Live ${{ matrix.version }} ${{ matrix.language }} compatibility
+    needs: [baseline, prepare]
+    # A failed preparation lane must not hide results from successfully built pairs.
+    if: ${{ !cancelled() && needs.baseline.result == 'success' }}
     # PR-controlled code runs in a fresh hosted VM, not a persistent self-hosted machine.
     runs-on: ubuntu-24.04
     timeout-minutes: 60
@@ -119,6 +125,7 @@ jobs:
       fail-fast: false
       max-parallel: 2
       matrix:
+        version: ${{ fromJson(needs.baseline.outputs.versions) }}
         language: [rust, python, node, go, ruby]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -144,7 +151,7 @@ jobs:
           path: build/
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: compatibility-sdk-${{ matrix.language }}
+          name: compatibility-sdk-${{ matrix.version }}-${{ matrix.language }}
           path: compatibility-sdk/
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         if: matrix.language == 'node'
@@ -160,7 +167,7 @@ jobs:
           tar -xzf compatibility-sdk/compatibility-payload.tar.gz -C compatibility-sdk/payload
           python3 scripts/compatibility/run.py \
             --payload compatibility-sdk/payload \
-            --baseline compatibility-baseline \
+            --baseline 'compatibility-baseline/${{ matrix.version }}' \
             --runtime build \
             --commit "$GITHUB_SHA" \
             --output compatibility-results
@@ -168,7 +175,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: compatibility-results-${{ matrix.language }}
+          name: compatibility-results-${{ matrix.version }}-${{ matrix.language }}
           path: |
             compatibility-results/*.json
             compatibility-results/*.jsonl

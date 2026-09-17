@@ -17,6 +17,7 @@ import tempfile
 import time
 
 from baseline import sha256
+import transitions
 
 
 PAIRS = (("candidate", "released"), ("released", "candidate"),
@@ -124,6 +125,19 @@ def installed_sdk(language, payload, record, scripts, setup_log):
     raise ValueError(language)
 
 
+def lifecycle_command(language, command, payload, scripts):
+    """Choose a common-API fixture without substituting any SDK implementation."""
+    if language == "python":
+        return [command[0], str(scripts / "scenarios/lifecycle.py")]
+    if language == "node":
+        return [command[0], str(payload / "app/lifecycle.cjs")]
+    if language == "ruby":
+        return [command[0], str(scripts / "scenarios/lifecycle.rb")]
+    binary = payload / "lifecycle"
+    binary.chmod(0o700)
+    return [str(binary)]
+
+
 def validate_report(report, evidence, expected_hash=None):
     cases = report.get("cases", report.get("passed", []))
     if report.get("status") != "passed" or not isinstance(cases, list) or not cases:
@@ -221,6 +235,9 @@ def execute(args):
             env = environment(home, binary, home / "lib" / fw.name, mode == "explicit-fresh")
             record = manifest["sdks"][sdk]
             command, sdk_env, cwd = commands[sdk]
+            if tuple(map(int, release["version"].split('.')[:2])) < (0, 7) and manifest["language"] != "ruby":
+                command = lifecycle_command(manifest["language"], command, payload / sdk, scripts)
+                case["coverage"] = "common lifecycle: create, 0/1/3 tmpfs mounts, env, persistent restart"
             env.update(sdk_env)
             env.update(MSB_COMPAT_REPORT=str(output / f"{label}.json"), MSB_COMPAT_CASE="all",
                        MSB_COMPAT_IMAGE=args.image, MSB_COMPAT_SDK_VERSION=record["version"],
@@ -265,7 +282,14 @@ def execute(args):
                 case["seconds"] = round(time.monotonic() - started, 3)
                 (output / "results.json").write_text(json.dumps(results, indent=2) + "\n")
                 print(json.dumps(case), flush=True)
-    expected = len([pair for pair in PAIRS if pair[0] in commands]) * 2
+    transition_cases = transitions.execute(
+        commands=commands, manifest=manifest, payload=payload, runtimes=runtimes,
+        scripts=scripts, output=output, image=args.image,
+        environment=environment, run=run, schema=schema, cleanup=cleanup,
+        lifecycle_command=lifecycle_command, validate_report=validate_report)
+    results["cases"].extend(transition_cases)
+    (output / "results.json").write_text(json.dumps(results, indent=2) + "\n")
+    expected = len([pair for pair in PAIRS if pair[0] in commands]) * 2 + 1 + len(commands)
     if len(results["cases"]) != expected or any(case["status"] != "passed" for case in results["cases"]):
         raise RuntimeError("SDK/runtime compatibility failed; see results.json and per-case logs")
 

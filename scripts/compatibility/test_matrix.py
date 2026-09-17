@@ -111,12 +111,13 @@ class BaselineTests(unittest.TestCase):
                     baseline.unpack_runtime(root / "bundle.tar.gz", root / "destination")
 
     def resolve_fixture(self, directory, *, modern=True, duplicate=False, wrong_ruby=False):
-        prefix = f"https://github.com/{baseline.REPOSITORY}/releases/download/v0.7.0/"
+        tag = "v0.7.1" if wrong_ruby else "v0.7.0"
+        prefix = f"https://github.com/{baseline.REPOSITORY}/releases/download/{tag}/"
         assets = {baseline.BUNDLE: runtime_archive(), baseline.GO_FFI: b"ffi"}
         assets["checksums.sha256"] = "".join(
             f"{hashlib.sha256(content).hexdigest()} {name}\n" for name, content in assets.items()
         ).encode()
-        release = {"tag_name": "v0.7.0", "draft": False, "prerelease": False,
+        release = {"tag_name": tag, "draft": False, "prerelease": False,
                    "html_url": prefix.rstrip("/"), "assets": [
                        {"name": name, "browser_download_url": prefix + name} for name in assets]}
         if duplicate:
@@ -132,7 +133,7 @@ class BaselineTests(unittest.TestCase):
             if "/git/tags/" in url:
                 return {"object": {"type": "commit", "sha": COMMIT}}
             if url.startswith("https://rubygems.org/"):
-                return [{"number": "0.7.1" if wrong_ruby else "0.7.0"}] if modern else [{"number": "0.1.0"}]
+                return [{"number": "0.7.0"}] if modern else [{"number": "0.1.0"}]
             raise AssertionError(f"unexpected request: {url}")
 
         with mock.patch.object(baseline, "read_json", side_effect=read_json), \
@@ -258,6 +259,19 @@ class RuntimeProvenanceTests(unittest.TestCase):
             (proc / "2").mkdir()
             with self.assertRaisesRegex(RuntimeError, "no live VM"):
                 verify_runtime.verify("/fixture", DIGEST, "fixture", proc)
+
+    def test_upgrade_identity_exception_is_bound_to_exact_sandbox_name(self):
+        old = hashlib.sha256(b"old-runtime").hexdigest()
+        with tempfile.TemporaryDirectory() as directory:
+            proc = Path(directory)
+            self.add_process(proc, 1, sandbox="retained")
+            self.add_process(proc, 2, executable=b"old-runtime", sandbox="active")
+            identities = {"active": old, "retained": DIGEST}
+            self.assertEqual(verify_runtime.verify("/fixture", DIGEST, "retained", proc, identities)[0]['pid'], 1)
+            self.assertEqual(verify_runtime.verify("/fixture", DIGEST, "active", proc, identities)[0]['pid'], 2)
+            (proc/'1/exe').write_bytes(b"old-runtime")
+            with self.assertRaisesRegex(RuntimeError, 'unexpected runtime'):
+                verify_runtime.verify("/fixture", DIGEST, "active", proc, identities)
 
 
 class ReportTests(unittest.TestCase):
@@ -390,13 +404,16 @@ class ExecutionTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(matrix, "installed_sdk", return_value=(["scenario-command"], {}, self.payload)))
             stack.enter_context(mock.patch.object(matrix, "run", side_effect=command))
             stack.enter_context(mock.patch.object(matrix, "cleanup", side_effect=RuntimeError("cleanup failure") if cleanup_fail else None))
+            # Transition orchestration has its own failure-injection tests.
+            stack.enter_context(mock.patch.object(matrix.transitions, "execute", return_value=[
+                dict(case=f"transition-{i}", status="passed") for i in range(3)]))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             matrix.execute(self.args)
 
     def test_complete_matrix_has_both_directions_controls_and_home_modes(self):
         self.run_fixture()
         report = json.loads((self.args.output / "results.json").read_text())
-        self.assertEqual(len(report["cases"]), 8)
+        self.assertEqual(len(report["cases"]), 11)
         self.assertTrue(all(case["status"] == "passed" for case in report["cases"]))
         self.assertFalse(list(self.root.glob("fixture-*")))
 
@@ -438,13 +455,15 @@ class ExecutionTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.run_fixture(omit_report=True)
         report = json.loads((self.args.output / "results.json").read_text())
-        self.assertTrue(all(case["status"] == "failed" for case in report["cases"]))
+        self.assertTrue(all(case["status"] == "failed" for case in report["cases"] if not case["case"].startswith("transition-")))
 
     def test_cleanup_preserves_primary_failure_and_diagnostic_home(self):
         with self.assertRaises(RuntimeError):
             self.run_fixture(fail=True, cleanup_fail=True)
         report = json.loads((self.args.output / "results.json").read_text())
         for case in report["cases"]:
+            if case["case"].startswith("transition-"):
+                continue
             self.assertEqual(case["status"], "failed")
             self.assertIn("original scenario failure", case["error"])
             self.assertIn("cleanup failure", case["cleanup_error"])
@@ -472,7 +491,8 @@ class PreparationTests(unittest.TestCase):
                      "sdk/node-ts/dist/index.js": b"exports.fixture = true;",
                      "sdk/node-ts/package.json": b'{"name":"microsandbox","version":"0.7.0"}',
                      "packages/microsandbox-types/typescript/index.js": b"exports.types = true;",
-                     "scripts/compatibility/scenarios/node.cjs": b"console.log('fixture');"}
+                     "scripts/compatibility/scenarios/node.cjs": b"console.log('fixture');",
+                     "scripts/compatibility/scenarios/lifecycle.cjs": b"console.log('lifecycle');"}
             for name, data in files.items():
                 destination = source / name
                 destination.parent.mkdir(parents=True, exist_ok=True)

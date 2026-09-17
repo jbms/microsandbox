@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 
 
-def verify(home, expected_hash, sandbox, proc=Path("/proc")):
+def verify(home, expected_hash, sandbox, proc=Path("/proc"), expected_by_sandbox=None):
     matches = []
     for entry in proc.iterdir():
         if not entry.name.isdigit():
@@ -22,14 +22,19 @@ def verify(home, expected_hash, sandbox, proc=Path("/proc")):
             args = (entry / "cmdline").read_bytes().split(b"\0")
             if len(args) < 2 or args[1] not in (b"machine", b"sandbox"):
                 continue
+            names = [value for flag, value in zip(args, args[1:]) if flag == b"--name"]
+            expected = expected_hash
+            # Upgrade fixtures intentionally retain a named old process beside
+            # a new one. Never allow an arbitrary second executable for the home.
+            if expected_by_sandbox and len(names) == 1:
+                expected = expected_by_sandbox.get(os.fsdecode(names[0]), expected_hash)
             with (entry / "exe").open("rb") as stream:
                 digest = hashlib.file_digest(stream, "sha256").hexdigest()
-            if digest != expected_hash:
+            if digest != expected:
                 raise RuntimeError(f"fixture PID {entry.name} ran unexpected runtime {digest}")
             # Check every owned VM's executable before selecting the requested
             # name: a healthy control VM must not hide a missing target or a
             # different VM running the wrong binary in this same fixture home.
-            names = [value for flag, value in zip(args, args[1:]) if flag == b"--name"]
             if names == [os.fsencode(sandbox)]:
                 matches.append(dict(pid=int(entry.name), executable=str((entry / "exe").resolve()), sha256=digest))
         except (FileNotFoundError, ProcessLookupError):
@@ -46,7 +51,8 @@ def verify(home, expected_hash, sandbox, proc=Path("/proc")):
 
 if __name__ == "__main__":
     record = dict(sandbox=sys.argv[1], runtimes=verify(os.environ["MSB_HOME"],
-                  os.environ["MSB_COMPAT_RUNTIME_SHA256"], sys.argv[1]))
+                  os.environ["MSB_COMPAT_RUNTIME_SHA256"], sys.argv[1],
+                  expected_by_sandbox=json.loads(os.environ.get("MSB_COMPAT_RUNTIME_IDENTITIES", "{}"))))
     with open(os.environ["MSB_COMPAT_RUNTIME_REPORT"], "a") as log:
         log.write(json.dumps(record) + "\n")
     print(json.dumps(record))

@@ -180,7 +180,7 @@ func lifecycle(ctx context.Context, r *report, count int) (err error) {
 	marker := "compat-go-" + r.Case + "-" + label
 	options := []msb.SandboxOption{
 		msb.WithImage(os.Getenv("MSB_COMPAT_IMAGE")), msb.WithMemory(256), msb.WithCPUs(1),
-		msb.WithEnv(map[string]string{"MSB_COMPAT_MARKER": marker}),
+		msb.WithEnv(map[string]string{"COMPAT_MARKER": marker}),
 	}
 	mounts := map[string]msb.MountConfig{}
 	for i := 0; i < count; i++ {
@@ -203,7 +203,7 @@ func lifecycle(ctx context.Context, r *report, count int) (err error) {
 	if err = verifyRuntime(ctx, r, name); err != nil {
 		return err
 	}
-	output, err := sandbox.Exec(ctx, "/bin/sh", []string{"-c", `printf '%s' "$MSB_COMPAT_MARKER"`})
+	output, err := sandbox.Exec(ctx, "/bin/sh", []string{"-c", `printf '%s' "$COMPAT_MARKER"`})
 	if err != nil {
 		return err
 	}

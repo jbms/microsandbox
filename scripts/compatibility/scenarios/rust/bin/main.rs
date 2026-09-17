@@ -107,8 +107,8 @@ async fn run_case(
     let name = format!("compat-rust-{case}-{}", std::process::id());
     let mut builder = Sandbox::builder(&name)
         .image(image)
-        .env("MSB_COMPAT_SENTINEL", "spaces = unicode-λ")
-        .env("MSB_COMPAT_EMPTY", "");
+        .env("COMPAT_SENTINEL", "spaces = unicode-λ")
+        .env("COMPAT_EMPTY", "");
     if let Some(count) = case.strip_prefix("tmpfs-") {
         for index in 0..count.parse::<usize>()? {
             builder = builder.volume(format!("/compat-tmpfs-{index}"), |mount| {
@@ -127,7 +127,7 @@ async fn run_case(
     check(
         &sandbox,
         "exec and environment",
-        r#"test "$MSB_COMPAT_SENTINEL" = 'spaces = unicode-λ' && test "${MSB_COMPAT_EMPTY+x}" = x && test -z "$MSB_COMPAT_EMPTY" && printf compat-exec-ok"#,
+        r#"test "$COMPAT_SENTINEL" = 'spaces = unicode-λ' && test "${COMPAT_EMPTY+x}" = x && test -z "$COMPAT_EMPTY" && printf compat-exec-ok"#,
         "compat-exec-ok",
         checks,
     )

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pin one published release and verify its Linux runtime for every CI lane."""
+"""Pin latest, previous and 0.6.18 baselines once for every CI lane."""
 
 import argparse
 import hashlib
@@ -61,8 +61,42 @@ def unpack_runtime(bundle, destination):
 
 
 def resolve(output):
+    return provision(read_json(f"https://api.github.com/repos/{REPOSITORY}/releases/latest"), output)
+
+
+def select_releases(releases):
+    """Publication dates can reorder backports; choose stable semantic versions."""
+    stable = {entry["tag_name"]: entry for entry in releases
+              if not entry["draft"] and not entry["prerelease"]
+              and re.fullmatch(r"v\d+\.\d+\.\d+", entry["tag_name"])}
+    ordered = sorted(stable, key=lambda tag: tuple(map(int, tag[1:].split("."))), reverse=True)
+    if len(ordered) < 2 or "v0.6.18" not in stable:
+        raise ValueError("latest, previous and historical v0.6.18 baselines are required")
+    return [stable[tag] for tag in dict.fromkeys([*ordered[:2], "v0.6.18"])]
+
+
+def resolve_matrix(output):
+    releases = []
+    page = 1
+    while True:
+        batch = read_json(f"https://api.github.com/repos/{REPOSITORY}/releases?per_page=100&page={page}")
+        releases.extend(batch)
+        if len(batch) < 100:
+            break
+        page += 1
+    selected = select_releases(releases)
     output.mkdir(parents=True, exist_ok=False)
-    release = read_json(f"https://api.github.com/repos/{REPOSITORY}/releases/latest")
+    for entry in selected:
+        provision(entry, output / entry["tag_name"])
+    tags = [entry["tag_name"] for entry in selected]
+    (output / "selection.json").write_text(json.dumps(tags) + "\n")
+    if os.environ.get("GITHUB_OUTPUT"):
+        with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
+            stream.write(f"versions={json.dumps(tags)}\n")
+
+
+def provision(release, output):
+    output.mkdir(parents=True, exist_ok=False)
     tag = release["tag_name"]
     if release["draft"] or release["prerelease"] or not re.fullmatch(r"v\d+\.\d+\.\d+", tag):
         raise ValueError("baseline must be a stable published release")
@@ -92,10 +126,13 @@ def resolve(output):
     # The unrelated Ruby 0.1 SDK is outside the supported compatibility floor.
     # Once a modern gem exists, a missing matching gem is a publication failure,
     # not permission to silently drop reverse-direction coverage.
-    if modern and tag[1:] not in modern:
+    # Historical releases before the first modern gem cannot acquire one later.
+    first_ruby = min((tuple(map(int, version.split("."))) for version in modern), default=None)
+    ruby_expected = first_ruby is not None and tuple(map(int, tag[1:].split("."))) >= first_ruby
+    if ruby_expected and tag[1:] not in modern:
         raise ValueError(f"Ruby SDK {tag} is missing from the release train")
     record = dict(tag=tag, version=tag[1:], commit=ref["sha"], release_url=release["html_url"],
-                  ruby_released=bool(modern), firmware=firmware,
+                  ruby_released=ruby_expected, firmware=firmware,
                   hashes={name: sha256(output / name) for name in ("msb", firmware, GO_FFI, BUNDLE)})
     (output / "baseline.json").write_text(json.dumps(record, indent=2) + "\n")
     print(json.dumps(record, indent=2))
@@ -104,4 +141,6 @@ def resolve(output):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
-    resolve(parser.parse_args().output)
+    parser.add_argument("--matrix", action="store_true")
+    args = parser.parse_args()
+    (resolve_matrix if args.matrix else resolve)(args.output)

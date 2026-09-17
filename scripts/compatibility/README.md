@@ -4,7 +4,7 @@ This gate tests the SDK/runtime boundary, not source-level API compatibility. It
 
 ## Matrix
 
-The baseline job resolves the latest stable GitHub release once and records its tag, peeled commit, runtime/firmware hashes and Go FFI hash. All language jobs consume that same artifact. New releases are picked up on the next workflow run; individual matrix cells never independently resolve `latest`.
+The baseline job pins the latest stable release, its semantic-version predecessor, and `v0.6.18`, deduplicating overlaps. Each tag, peeled commit, runtime/firmware hash and Go FFI hash is recorded once. Publishing a release therefore does not immediately remove its predecessor from coverage. Drafts, prereleases and SDK-specific tags are excluded.
 
 | SDK | Runtime | Purpose |
 | --- | --- | --- |
@@ -13,11 +13,25 @@ The baseline job resolves the latest stable GitHub release once and records its 
 | Released | Released | Baseline control |
 | Candidate | Candidate | Candidate control using the same scenarios |
 
-Each pairing runs twice: explicit `MSB_PATH` with a fresh home, then installed-runtime discovery without `MSB_PATH`/`MSB_LIBKRUNFW_PATH` in a home initialized by the released CLI. That second lane starts with an empty released catalog and tests SDK writes against its schema, not access to pre-existing user sandbox rows. Existing catalog schemas and migration histories must remain unchanged after SDK access. The CLI inspects SDK-created records while their VMs are live.
+For each pinned baseline, each pairing runs twice: explicit `MSB_PATH` with a fresh home, then installed-runtime discovery without `MSB_PATH`/`MSB_LIBKRUNFW_PATH` in a home initialized by the released CLI. That second lane starts with an empty released catalog. Existing catalog schemas and migration histories must remain unchanged after SDK access. The CLI inspects SDK-created records. Bundled-runtime substitution is a failure, not evidence for the requested pairing.
 
 Rust, Python, Node and Go run lifecycle, environment, multiple mount cardinalities, persistent disk restart, network isolation and disk snapshot restore scenarios. Rust, Python and Node also exercise archive restore. Node is tested with Node.js, not Bun. Ruby runs its exposed lifecycle/filesystem and disabled-network operations; custom mounts and snapshot restore are not exposed by its current public API and are reported as not applicable rather than substituted with CLI calls.
 
-As of this change, RubyGems has only the unrelated `0.1.0` SDK, below our supported compatibility floor. Candidate Ruby is tested against both runtimes, but released-Ruby coverage is explicitly unavailable. Once any modern Ruby gem is published, the matching baseline version becomes mandatory: a missing gem fails provisioning instead of silently dropping the reverse lane.
+For the `0.6.18` boundary, Rust/Python/Node/Go use a common public-API fixture covering create, 0/1/3 tmpfs mounts, guest environment, persistent disk writes, stop/start, removal and actual runtime identity. This lane does not claim network-policy or snapshot-restore coverage: its published SDK predates the dedicated restore API. Rust uses that release's `net,prebuilt` features and published Agentd, not the newer `local` feature or candidate guest payload. Modern baselines retain the wider existing suite.
+
+As of this change, RubyGems has only the unrelated `0.1.0` SDK. Candidate Ruby is tested against both runtimes, but released-Ruby coverage is explicitly unavailable. Baselines preceding the first modern gem retain that exception. At or after that first modern version, a missing matching gem fails provisioning instead of silently dropping the reverse lane.
+
+## Upgrade transitions
+
+Each baseline also seeds populated homes with its real CLI, including a persistent disk marker, environment and tmpfs mount:
+
+- **Already-running old VM:** retain one old VM, atomically replace the installed binary/firmware, and use the candidate CLI to list, execute, stop and start sandboxes. Starting another stopped sandbox must work without replacing the old VM or changing its catalog schema underneath it. A stop-all migration refusal fails this workflow; diagnostic commands and stop/retry recovery are still exercised afterward. This PR does not weaken any runtime or migration guard.
+- **After CLI upgrade, candidate SDK:** let the candidate CLI prepare the catalog and start/stop the retained sandbox, then use the candidate SDK to restart it twice and verify disk data, environment, mount and runtime identity.
+- **After CLI upgrade, released SDK:** repeat with the published SDK. Refusing a newer catalog is a compatibility failure, not a pass merely because it avoids corruption. SDK access must preserve the CLI-prepared schema/history.
+
+When both releases share a schema, CLI preparation may be a no-op; otherwise the same transition exercises migration. Mixed-version process checks permit only the specifically named old/new executables, not arbitrary binaries in the fixture home.
+
+Bump PRs are included: manifest/lockfile changes are code changes, and candidate artifacts are built after the bump. Automatically generated bump PRs may require workflow approval. This PR does not change release creation or publication automation.
 
 ## Avoiding false passes
 
@@ -38,10 +52,10 @@ Run the infrastructure checks without VMs or network access:
 python3 -W error -m unittest discover -s scripts/compatibility -p 'test_*.py'
 ```
 
-The reusable workflow shows the exact provisioning and live commands. Each language uploads `compatibility-results-<language>` with `results.json`, SDK reports, observed runtime identities, per-cell durations, and setup/test/cleanup logs. Review missing Ruby coverage explicitly; a successful candidate-Ruby lane is not a released-Ruby pass.
+The reusable workflow shows the exact provisioning and live commands. Each baseline/language uploads `compatibility-results-<tag>-<language>` with `results.json`, SDK reports, runtime identities, per-cell durations, and setup/test/cleanup logs. A successful candidate-Ruby lane is not a released-Ruby pass.
 
 ## Boundaries
 
-This is the latest-stable Linux x86-64 gate. It does not claim macOS/HVF, Windows/WHP, Linux ARM64, full-memory/branch snapshot coverage, arbitrary cross-version archives, exhaustive crash recovery, or the complete `0.6.x` support matrix. Those still require their dedicated qualification. The separate `0.6.18` catalog regression fixture introduced by #1589 must remain enabled after that PR merges; passing against the latest release cannot replace it. Broader historical and cross-platform qualification is follow-up work, not an implicit skip inside this gate.
+This is a three-baseline Linux x86-64 gate. It does not claim macOS/HVF, Windows/WHP, Linux ARM64, full-memory/branch snapshots, arbitrary cross-version archives, exhaustive crash recovery, or the complete `0.6.x` support matrix. The separate `0.6.18` catalog regression fixture must remain enabled. Additional catalog/launch-boundary representatives on bump PRs and scheduled all-supported-version qualification remain follow-up work, not implemented coverage.
 
-This PR is intended to merge after #1589 and the `0.7.1` release. Until that release is published, the automatically selected baseline remains `0.7.0`.
+After the `0.7.1` release, selection is `0.7.1`, `0.7.0` and `0.6.18`. Package-publication availability remains fail-closed: no fallback silently replaces a baseline whose package is unavailable.
