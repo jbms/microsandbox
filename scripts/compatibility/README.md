@@ -4,7 +4,9 @@ This gate tests the SDK/runtime boundary, not source-level API compatibility. It
 
 ## Matrix
 
-The baseline job pins the latest stable release, its semantic-version predecessor, and `v0.6.18`, deduplicating overlaps. Each tag, peeled commit, runtime/firmware hash and Go FFI hash is recorded once. Publishing a release therefore does not immediately remove its predecessor from coverage. Drafts, prereleases and SDK-specific tags are excluded.
+The support window is the candidate's minor line and its immediately previous minor line: 0.N.x against 0.N.x and 0.(N-1).x, in both directions. The baseline job reads the candidate version from `Cargo.toml`, not the globally latest release. The PR gate samples the two newest stable patches in the current line and the newest stable patch in the previous line. Each tag, peeled commit, runtime/firmware hash and Go FFI hash is recorded once. Drafts, prereleases and SDK-specific tags are excluded. There is no permanent historical baseline.
+
+On a minor-bump PR, the current line may have no published release yet. Candidate/candidate controls cover that new line, alongside the newest published patch of the previous line; the gate never falls back to a release two minor lines behind. A missing previous-line release fails selection. Major-version policy requires a deliberate update rather than silently reusing the 0.N.x rule. `policy.json` records the candidate version and selected sample.
 
 | SDK | Runtime | Purpose |
 | --- | --- | --- |
@@ -17,7 +19,7 @@ For each pinned baseline, each pairing runs twice: explicit `MSB_PATH` with a fr
 
 Rust, Python, Node and Go run lifecycle, environment, multiple mount cardinalities, persistent disk restart, network isolation and disk snapshot restore scenarios. Rust, Python and Node also exercise archive restore. Node is tested with Node.js, not Bun. Ruby runs its exposed lifecycle/filesystem and disabled-network operations; custom mounts and snapshot restore are not exposed by its current public API and are reported as not applicable rather than substituted with CLI calls.
 
-For the `0.6.18` boundary, Rust/Python/Node/Go use a common public-API fixture covering create, 0/1/3 tmpfs mounts, guest environment, persistent disk writes, stop/start, removal and actual runtime identity. This lane does not claim network-policy or snapshot-restore coverage: its published SDK predates the dedicated restore API. Rust uses that release's `net,prebuilt` features and published Agentd, not the newer `local` feature or candidate guest payload. Modern baselines retain the wider existing suite.
+For selected pre-0.7 baselines, Rust/Python/Node/Go use a common public-API fixture covering create, 0/1/3 tmpfs mounts, guest environment, persistent disk writes, stop/start, removal and actual runtime identity. This lane does not claim network-policy or snapshot-restore coverage: those SDKs predate the dedicated restore API. Rust uses the release's `net,prebuilt` features and published Agentd, not the newer `local` feature or candidate guest payload. Modern baselines retain the wider existing suite.
 
 As of this change, RubyGems has only the unrelated `0.1.0` SDK. Candidate Ruby is tested against both runtimes, but released-Ruby coverage is explicitly unavailable. Baselines preceding the first modern gem retain that exception. At or after that first modern version, a missing matching gem fails provisioning instead of silently dropping the reverse lane.
 
@@ -56,6 +58,6 @@ The reusable workflow shows the exact provisioning and live commands. Each basel
 
 ## Boundaries
 
-This is a three-baseline Linux x86-64 gate. It does not claim macOS/HVF, Windows/WHP, Linux ARM64, full-memory/branch snapshots, arbitrary cross-version archives, exhaustive crash recovery, or the complete `0.6.x` support matrix. The separate `0.6.18` catalog regression fixture must remain enabled. Additional catalog/launch-boundary representatives on bump PRs and scheduled all-supported-version qualification remain follow-up work, not implemented coverage.
+This is a sampled, two-minor-line Linux x86-64 gate, with up to three published baselines. It does not claim every patch in the support window, macOS/HVF, Windows/WHP, Linux ARM64, full-memory/branch snapshots, arbitrary cross-version archives or exhaustive crash recovery. Separate fixed catalog regression fixtures are not the SDK/runtime compatibility policy and are unchanged here. Additional patch coverage within the rolling window remains follow-up work, not implemented coverage.
 
-After the `0.7.1` release, selection is `0.7.1`, `0.7.0` and `0.6.18`. Package-publication availability remains fail-closed: no fallback silently replaces a baseline whose package is unavailable.
+For a 0.7.x candidate with releases through 0.7.1 and 0.6.18, selection is 0.7.1, 0.7.0 and 0.6.18. A later 0.6.19 replaces 0.6.18. A 0.8.0 bump with no published 0.8.x selects only 0.7.1 as its published baseline; once 0.8.0 and 0.8.1 ship, a 0.8.x candidate selects those two plus the latest 0.7.x patch. Package-publication availability remains fail-closed: no fallback silently replaces a baseline whose package is unavailable.

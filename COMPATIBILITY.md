@@ -8,6 +8,8 @@ Public SDK, CLI, and HTTP API compatibility is intentionally outside this map. T
 
 ## Compatibility Directions
 
+The SDK/runtime support window follows the candidate's minor line and the immediately previous minor line, in both directions: 0.N.x against 0.N.x and 0.(N-1).x. It is not anchored to a permanent historical release. CI may sample patches within that window; see [the compatibility gate](scripts/compatibility/README.md) for the tested sample and its limits. This policy does not by itself remove older persisted-format readers or protocol codecs.
+
 Review every direction that applies to the change:
 
 ```text

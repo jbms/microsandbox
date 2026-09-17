@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pin latest, previous and 0.6.18 baselines once for every CI lane."""
+"""Pin release samples from the candidate's current and previous minor lines."""
 
 import argparse
 import hashlib
@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import shutil
 import tarfile
+import tomllib
 import urllib.request
 
 
@@ -64,18 +65,32 @@ def resolve(output):
     return provision(read_json(f"https://api.github.com/repos/{REPOSITORY}/releases/latest"), output)
 
 
-def select_releases(releases):
-    """Publication dates can reorder backports; choose stable semantic versions."""
+def candidate_version(manifest):
+    with manifest.open("rb") as stream:
+        return tomllib.load(stream)["workspace"]["package"]["version"]
+
+
+def select_releases(releases, candidate):
+    """Sample two current patches and one previous-line patch, never global latest."""
+    match = re.fullmatch(r"0\.(\d+)\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?", candidate)
+    if not match or int(match[1]) == 0:
+        raise ValueError("compatibility selection requires a 0.N.x candidate with N >= 1")
+    minor = int(match[1])
     stable = {entry["tag_name"]: entry for entry in releases
               if not entry["draft"] and not entry["prerelease"]
               and re.fullmatch(r"v\d+\.\d+\.\d+", entry["tag_name"])}
     ordered = sorted(stable, key=lambda tag: tuple(map(int, tag[1:].split("."))), reverse=True)
-    if len(ordered) < 2 or "v0.6.18" not in stable:
-        raise ValueError("latest, previous and historical v0.6.18 baselines are required")
-    return [stable[tag] for tag in dict.fromkeys([*ordered[:2], "v0.6.18"])]
+    current = [tag for tag in ordered if tag.startswith(f"v0.{minor}.")]
+    previous = [tag for tag in ordered if tag.startswith(f"v0.{minor - 1}.")]
+    if not previous:
+        raise ValueError(f"previous minor line 0.{minor - 1}.x has no stable release")
+    # A minor-bump PR legitimately has no published current-line artifact yet.
+    # Candidate/candidate controls cover that line; never reach back two lines.
+    return [stable[tag] for tag in [*current[:2], previous[0]]]
 
 
-def resolve_matrix(output):
+def resolve_matrix(output, manifest):
+    candidate = candidate_version(manifest)
     releases = []
     page = 1
     while True:
@@ -84,12 +99,15 @@ def resolve_matrix(output):
         if len(batch) < 100:
             break
         page += 1
-    selected = select_releases(releases)
+    selected = select_releases(releases, candidate)
     output.mkdir(parents=True, exist_ok=False)
     for entry in selected:
         provision(entry, output / entry["tag_name"])
     tags = [entry["tag_name"] for entry in selected]
     (output / "selection.json").write_text(json.dumps(tags) + "\n")
+    (output / "policy.json").write_text(json.dumps({
+        "candidate": candidate, "sampling": "two-current-patches-one-previous-patch",
+        "versions": tags}, indent=2) + "\n")
     if os.environ.get("GITHUB_OUTPUT"):
         with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
             stream.write(f"versions={json.dumps(tags)}\n")
@@ -142,5 +160,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--matrix", action="store_true")
+    parser.add_argument("--manifest", type=Path, default=Path("Cargo.toml"))
     args = parser.parse_args()
-    (resolve_matrix if args.matrix else resolve)(args.output)
+    if args.matrix:
+        resolve_matrix(args.output, args.manifest)
+    else:
+        resolve(args.output)

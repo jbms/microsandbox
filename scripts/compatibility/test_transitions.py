@@ -16,18 +16,31 @@ def release(tag, **kwargs):
 
 
 class SelectionTests(unittest.TestCase):
-    def test_semantic_order_pins_previous_even_after_publication(self):
+    def test_semantic_order_samples_only_candidate_and_previous_lines(self):
         tags = [release(tag) for tag in ['v0.6.18', 'v0.7.0', 'v0.7.1', 'v0.7.10', 'v0.7.2']]
-        tags += [release('v0.8.0', draft=True), release('v0.9.0', prerelease=True), release('v1.0.0-rc.1')]
-        self.assertEqual([r['tag_name'] for r in baseline.select_releases(tags)], ['v0.7.10', 'v0.7.2', 'v0.6.18'])
+        tags += [release('v0.8.0'), release('v0.7.11', draft=True), release('v0.7.12', prerelease=True), release('v1.0.0-rc.1')]
+        self.assertEqual([r['tag_name'] for r in baseline.select_releases(tags, '0.7.3')], ['v0.7.10', 'v0.7.2', 'v0.6.18'])
 
-    def test_historical_baseline_is_deduplicated_not_dropped(self):
-        tags = [release('v0.6.18'), release('v0.7.0')]
-        self.assertEqual([r['tag_name'] for r in baseline.select_releases(tags)], ['v0.7.0', 'v0.6.18'])
+    def test_previous_line_tracks_new_patches_without_a_permanent_pin(self):
+        tags = [release('v0.6.18'), release('v0.6.19'), release('v0.7.0')]
+        self.assertEqual([r['tag_name'] for r in baseline.select_releases(tags, '0.7.1')], ['v0.7.0', 'v0.6.19'])
+
+    def test_minor_bump_without_a_published_current_line(self):
+        tags = [release('v0.6.18'), release('v0.7.0'), release('v0.7.1')]
+        self.assertEqual([r['tag_name'] for r in baseline.select_releases(tags, '0.8.0-rc.1')], ['v0.7.1'])
+
+    def test_window_moves_after_a_minor_release(self):
+        tags = [release(tag) for tag in ['v0.6.18', 'v0.7.1', 'v0.8.0', 'v0.8.1', 'v0.9.0']]
+        self.assertEqual([r['tag_name'] for r in baseline.select_releases(tags, '0.8.2')], ['v0.8.1', 'v0.8.0', 'v0.7.1'])
+
+    def test_unsupported_candidate_version_is_not_silently_reinterpreted(self):
+        for candidate in ['1.0.0', '0.0.1', 'not-a-version']:
+            with self.subTest(candidate=candidate), self.assertRaises(ValueError):
+                baseline.select_releases([], candidate)
 
     def test_missing_required_history_is_an_error(self):
         with self.assertRaises(ValueError):
-            baseline.select_releases([release('v0.7.0'), release('v0.7.1')])
+            baseline.select_releases([release('v0.6.18'), release('v0.8.0')], '0.8.1')
 
     def test_pagination_pins_once_and_provisions_each_selected_version(self):
         pages = [[release('v0.7.1')] * 100, [release('v0.7.0'), release('v0.6.18')]]
@@ -36,12 +49,15 @@ class SelectionTests(unittest.TestCase):
                 mock.patch.object(baseline, 'provision') as provision, \
                 mock.patch.dict(baseline.os.environ, {'GITHUB_OUTPUT': str(Path(directory)/'outputs')}):
             output = Path(directory)/'baseline'
-            baseline.resolve_matrix(output)
+            manifest = Path(directory)/'Cargo.toml'
+            manifest.write_text('[workspace.package]\nversion = "0.7.2"\n')
+            baseline.resolve_matrix(output, manifest)
             self.assertEqual(query.call_count, 2)
             self.assertTrue(query.call_args.args[0].endswith('page=2'))
             self.assertEqual(provision.call_count, 3)
             self.assertEqual(json.loads((output/'selection.json').read_text()), ['v0.7.1', 'v0.7.0', 'v0.6.18'])
             self.assertIn('versions=', (Path(directory)/'outputs').read_text())
+            self.assertEqual(json.loads((output/'policy.json').read_text())['candidate'], '0.7.2')
 
     def test_bump_manifest_changes_are_not_filtered_out(self):
         root = Path(__file__).resolve().parents[2]
