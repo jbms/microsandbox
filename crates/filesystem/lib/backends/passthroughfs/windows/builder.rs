@@ -196,6 +196,7 @@ impl PassthroughFs {
             stat_store,
             quota,
             invalid_inodes: RwLock::new(std::collections::BTreeSet::new()),
+            map_windows: Mutex::new(BTreeMap::new()),
         })
     }
 

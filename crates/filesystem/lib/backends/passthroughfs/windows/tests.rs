@@ -1856,3 +1856,263 @@ fn owned_rename_replacement_and_cached_descendants_survive_capture() {
         5
     );
 }
+
+//--------------------------------------------------------------------------------------------------
+// DAX
+//--------------------------------------------------------------------------------------------------
+
+const DAX_GUEST_BASE: u64 = 0x1000_0000;
+const DAX_WINDOW: u64 = 0x2000;
+const DAX_FLAG_WRITE: u64 = 0x1;
+
+type DaxSender = crossbeam_channel::Sender<msb_krun_utils::worker_message::WorkerMessage>;
+type DaxRecorded = std::sync::Arc<std::sync::Mutex<Vec<(u64, u64, u64, bool)>>>;
+
+/// Spawn a stub VMM worker and return its sender and the mappings it received.
+fn dax_worker_stub(accept: bool) -> (DaxSender, DaxRecorded) {
+    use msb_krun_utils::worker_message::WorkerMessage;
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = seen.clone();
+    std::thread::spawn(move || {
+        while let Ok(message) = receiver.recv() {
+            match message {
+                WorkerMessage::DaxAddMapping(reply, host, guest, len, writable) => {
+                    recorded.lock().unwrap().push((host, guest, len, writable));
+                    let _ = reply.send(accept);
+                }
+                WorkerMessage::GpuRemoveMapping(reply, ..) => {
+                    let _ = reply.send(accept);
+                }
+                _ => {}
+            }
+        }
+    });
+    (sender, seen)
+}
+
+#[test]
+fn dax_setupmapping_readonly_round_trip() {
+    let temp = TempDir::new();
+    let content: Vec<u8> = (0..0x1000u32).map(|i| i as u8).collect();
+    std::fs::write(temp.path.join("data"), &content).unwrap();
+    let fs = fs_for(&temp.path);
+    let entry = fs.lookup(context(), ROOT_INODE, c"data").unwrap();
+
+    let (sender, seen) = dax_worker_stub(true);
+    fs.setupmapping(
+        context(),
+        entry.inode,
+        0,
+        0,
+        0x1000,
+        0,
+        0,
+        DAX_GUEST_BASE,
+        DAX_WINDOW,
+        &Some(sender),
+    )
+    .unwrap();
+
+    let recorded = seen.lock().unwrap().clone();
+    let &(host, guest, len, writable) = recorded.last().expect("mapping sent");
+    assert_eq!(guest, DAX_GUEST_BASE);
+    assert_eq!(len, 0x1000);
+    assert!(!writable);
+    // The host view backs the guest window, so reading it exposes the file.
+    let mapped = unsafe { std::slice::from_raw_parts(host as *const u8, 0x1000) };
+    assert_eq!(mapped, &content[..]);
+    drop(recorded);
+    assert_eq!(fs.map_windows.lock().unwrap().len(), 1);
+
+    let (sender, _) = dax_worker_stub(true);
+    fs.removemapping(
+        context(),
+        vec![crate::RemovemappingOne {
+            moffset: 0,
+            len: 0x1000,
+        }],
+        DAX_GUEST_BASE,
+        DAX_WINDOW,
+        &Some(sender),
+    )
+    .unwrap();
+    assert!(fs.map_windows.lock().unwrap().is_empty());
+}
+
+#[test]
+fn dax_setupmapping_writable_round_trip() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join("data"), vec![0u8; 0x1000]).unwrap();
+    let fs = fs_for(&temp.path);
+    let entry = fs.lookup(context(), ROOT_INODE, c"data").unwrap();
+
+    let (sender, seen) = dax_worker_stub(true);
+    fs.setupmapping(
+        context(),
+        entry.inode,
+        0,
+        0,
+        0x1000,
+        DAX_FLAG_WRITE,
+        0,
+        DAX_GUEST_BASE,
+        DAX_WINDOW,
+        &Some(sender),
+    )
+    .unwrap();
+
+    let &(_, guest, _, writable) = seen.lock().unwrap().last().unwrap();
+    assert_eq!(guest, DAX_GUEST_BASE);
+    assert!(writable);
+    assert_eq!(fs.map_windows.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn dax_setupmapping_honors_readonly() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join("data"), b"x").unwrap();
+    let fs = PassthroughFs::new(PassthroughConfig {
+        root_dir: temp.path.clone(),
+        inject_init: false,
+        readonly: true,
+        ..Default::default()
+    })
+    .unwrap();
+    fs.init(FsOptions::empty()).unwrap();
+    let entry = fs.lookup(context(), ROOT_INODE, c"data").unwrap();
+
+    let (sender, _) = dax_worker_stub(true);
+    expect_errno(
+        fs.setupmapping(
+            context(),
+            entry.inode,
+            0,
+            0,
+            0x1000,
+            DAX_FLAG_WRITE,
+            0,
+            DAX_GUEST_BASE,
+            DAX_WINDOW,
+            &Some(sender),
+        ),
+        LINUX_EROFS,
+    );
+}
+
+#[test]
+fn dax_setupmapping_rejected_reply_releases_view() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join("data"), vec![0u8; 0x1000]).unwrap();
+    let fs = fs_for(&temp.path);
+    let entry = fs.lookup(context(), ROOT_INODE, c"data").unwrap();
+
+    let (sender, _) = dax_worker_stub(false);
+    expect_errno(
+        fs.setupmapping(
+            context(),
+            entry.inode,
+            0,
+            0,
+            0x1000,
+            0,
+            0,
+            DAX_GUEST_BASE,
+            DAX_WINDOW,
+            &Some(sender),
+        ),
+        LINUX_EINVAL,
+    );
+    assert!(fs.map_windows.lock().unwrap().is_empty());
+}
+
+#[test]
+fn dax_removemapping_keeps_the_unremoved_tail() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join("data"), vec![0u8; 0x2000]).unwrap();
+    let fs = fs_for(&temp.path);
+    let entry = fs.lookup(context(), ROOT_INODE, c"data").unwrap();
+
+    let (sender, seen) = dax_worker_stub(true);
+    fs.setupmapping(
+        context(),
+        entry.inode,
+        0,
+        0,
+        0x2000,
+        0,
+        0,
+        DAX_GUEST_BASE,
+        DAX_WINDOW,
+        &Some(sender),
+    )
+    .unwrap();
+    let host = seen.lock().unwrap().last().unwrap().0;
+
+    let (sender, _) = dax_worker_stub(true);
+    fs.removemapping(
+        context(),
+        vec![crate::RemovemappingOne {
+            moffset: 0,
+            len: 0x1000,
+        }],
+        DAX_GUEST_BASE,
+        DAX_WINDOW,
+        &Some(sender),
+    )
+    .unwrap();
+
+    let windows = fs.map_windows.lock().unwrap();
+    assert_eq!(windows.len(), 1);
+    let tail = windows
+        .get(&(DAX_GUEST_BASE + 0x1000))
+        .expect("tail retained");
+    assert_eq!(tail.len, 0x1000);
+    assert_eq!(tail.host_addr, host + 0x1000);
+}
+
+#[test]
+fn dax_setupmapping_upgrades_existing_window() {
+    let temp = TempDir::new();
+    std::fs::write(temp.path.join("data"), vec![0u8; 0x1000]).unwrap();
+    let fs = fs_for(&temp.path);
+    let entry = fs.lookup(context(), ROOT_INODE, c"data").unwrap();
+
+    // Read-only mapping first.
+    let (sender, _) = dax_worker_stub(true);
+    fs.setupmapping(
+        context(),
+        entry.inode,
+        0,
+        0,
+        0x1000,
+        0,
+        0,
+        DAX_GUEST_BASE,
+        DAX_WINDOW,
+        &Some(sender),
+    )
+    .unwrap();
+
+    // The guest re-sends `FUSE_SETUPMAPPING` for the same range with WRITE to
+    // upgrade the mapping; it must replace the window, not fail.
+    let (sender, seen) = dax_worker_stub(true);
+    fs.setupmapping(
+        context(),
+        entry.inode,
+        0,
+        0,
+        0x1000,
+        DAX_FLAG_WRITE,
+        0,
+        DAX_GUEST_BASE,
+        DAX_WINDOW,
+        &Some(sender),
+    )
+    .unwrap();
+
+    let &(_, guest, _, writable) = seen.lock().unwrap().last().unwrap();
+    assert_eq!(guest, DAX_GUEST_BASE);
+    assert!(writable);
+    assert_eq!(fs.map_windows.lock().unwrap().len(), 1);
+}
