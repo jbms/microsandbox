@@ -6,7 +6,6 @@
 
 pub(crate) mod builder;
 mod create_ops;
-#[cfg(target_os = "linux")]
 mod dax;
 mod dir_ops;
 mod file_ops;
@@ -233,6 +232,10 @@ pub struct PassthroughFs {
 
     /// Optional guest-write byte budget for this mount's subtree.
     pub(crate) quota: Option<super::quota::DirQuota>,
+
+    /// Installed macOS DAX mappings, keyed by guest address.
+    #[cfg(target_os = "macos")]
+    pub(crate) map_windows: std::sync::Mutex<BTreeMap<u64, dax::WindowMapping>>,
 }
 
 /// Open directory handle with a lazy point-in-time snapshot.
@@ -394,6 +397,8 @@ impl PassthroughFs {
             #[cfg(target_os = "linux")]
             proc_self_fd,
             quota,
+            #[cfg(target_os = "macos")]
+            map_windows: std::sync::Mutex::new(BTreeMap::new()),
         })
     }
 }
@@ -1032,6 +1037,51 @@ impl DynFileSystem for PassthroughFs {
         shm_size: u64,
     ) -> io::Result<()> {
         dax::do_removemapping(&requests, host_shm_base, shm_size)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
+    fn setupmapping(
+        &self,
+        _ctx: Context,
+        inode: u64,
+        handle: u64,
+        foffset: u64,
+        len: u64,
+        flags: u64,
+        moffset: u64,
+        host_shm_base: u64,
+        shm_size: u64,
+        map_sender: &Option<
+            crossbeam_channel::Sender<msb_krun_utils::worker_message::WorkerMessage>,
+        >,
+    ) -> io::Result<()> {
+        dax::do_setupmapping(
+            self,
+            inode,
+            handle,
+            foffset,
+            len,
+            flags,
+            moffset,
+            host_shm_base,
+            shm_size,
+            map_sender,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    fn removemapping(
+        &self,
+        _ctx: Context,
+        requests: Vec<crate::RemovemappingOne>,
+        host_shm_base: u64,
+        shm_size: u64,
+        map_sender: &Option<
+            crossbeam_channel::Sender<msb_krun_utils::worker_message::WorkerMessage>,
+        >,
+    ) -> io::Result<()> {
+        dax::do_removemapping(self, &requests, host_shm_base, shm_size, map_sender)
     }
 }
 

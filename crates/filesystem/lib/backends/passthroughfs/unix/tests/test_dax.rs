@@ -337,3 +337,234 @@ fn setupmapping_rejects_a_handle_for_another_inode() {
 
     unsafe { libc::munmap(base, len) };
 }
+
+// macOS uses a separate worker-message path and mapping registry; exercise it
+// with a stub worker that can accept or reject mappings.
+
+/// Spawn a stub VMM worker and return its sender and the mappings it received.
+#[cfg(target_os = "macos")]
+fn macos_worker_stub(
+    accept: bool,
+) -> (
+    crossbeam_channel::Sender<msb_krun_utils::worker_message::WorkerMessage>,
+    std::sync::Arc<std::sync::Mutex<Vec<(u64, u64, u64, bool)>>>,
+) {
+    use msb_krun_utils::worker_message::WorkerMessage;
+    let (sender, receiver) = crossbeam_channel::unbounded();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = seen.clone();
+    std::thread::spawn(move || {
+        while let Ok(message) = receiver.recv() {
+            match message {
+                WorkerMessage::DaxAddMapping(reply, host, guest, len, writable) => {
+                    recorded.lock().unwrap().push((host, guest, len, writable));
+                    let _ = reply.send(accept);
+                }
+                WorkerMessage::GpuRemoveMapping(reply, ..) => {
+                    let _ = reply.send(accept);
+                }
+                _ => {}
+            }
+        }
+    });
+    (sender, seen)
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn setupmapping_installs_macos_mapping() {
+    const GUEST_BASE: u64 = 0x1000_0000;
+    const WINDOW: u64 = 0x2000;
+    let len = 0x1000u64;
+
+    let sb = TestSandbox::with_config(|mut cfg| {
+        cfg.inject_init = false;
+        cfg
+    });
+    let content: Vec<u8> = (0..len as usize).map(|i| i as u8).collect();
+    sb.host_create_file("data", &content);
+    let entry = sb.lookup_root("data").unwrap();
+
+    let (sender, seen) = macos_worker_stub(true);
+    sb.fs
+        .setupmapping(
+            sb.ctx(),
+            entry.inode,
+            0,
+            0,
+            len,
+            0,
+            0,
+            GUEST_BASE,
+            WINDOW,
+            &Some(sender),
+        )
+        .expect("setupmapping");
+
+    let recorded = seen.lock().unwrap().clone();
+    let &(host, guest, mapped_len, writable) = recorded.last().expect("mapping sent");
+    assert_eq!(guest, GUEST_BASE);
+    assert_eq!(mapped_len, len);
+    assert!(!writable);
+    let mapped = unsafe { std::slice::from_raw_parts(host as *const u8, len as usize) };
+    assert_eq!(mapped, &content[..]);
+    drop(recorded);
+
+    assert_eq!(sb.fs.map_windows.lock().unwrap().len(), 1);
+
+    let (sender, _) = macos_worker_stub(true);
+    sb.fs
+        .removemapping(
+            sb.ctx(),
+            vec![crate::RemovemappingOne { moffset: 0, len }],
+            GUEST_BASE,
+            WINDOW,
+            &Some(sender),
+        )
+        .expect("removemapping");
+    assert!(sb.fs.map_windows.lock().unwrap().is_empty());
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn removemapping_keeps_the_unremoved_tail() {
+    const GUEST_BASE: u64 = 0x1000_0000;
+    const WINDOW: u64 = 0x2000;
+    let len = 0x2000u64;
+
+    let sb = TestSandbox::with_config(|mut cfg| {
+        cfg.inject_init = false;
+        cfg
+    });
+    sb.host_create_file("data", &[0u8; 0x2000]);
+    let entry = sb.lookup_root("data").unwrap();
+
+    let (sender, seen) = macos_worker_stub(true);
+    sb.fs
+        .setupmapping(
+            sb.ctx(),
+            entry.inode,
+            0,
+            0,
+            len,
+            0,
+            0,
+            GUEST_BASE,
+            WINDOW,
+            &Some(sender),
+        )
+        .unwrap();
+    let host = seen.lock().unwrap().last().unwrap().0;
+
+    let (sender, _) = macos_worker_stub(true);
+    sb.fs
+        .removemapping(
+            sb.ctx(),
+            vec![crate::RemovemappingOne {
+                moffset: 0,
+                len: 0x1000,
+            }],
+            GUEST_BASE,
+            WINDOW,
+            &Some(sender),
+        )
+        .unwrap();
+
+    let windows = sb.fs.map_windows.lock().unwrap();
+    assert_eq!(windows.len(), 1);
+    let tail = windows.get(&(GUEST_BASE + 0x1000)).expect("tail retained");
+    assert_eq!(tail.len, 0x1000);
+    assert_eq!(tail.host_addr, host + 0x1000);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn setupmapping_releases_host_mapping_when_rejected() {
+    const GUEST_BASE: u64 = 0x1000_0000;
+    const WINDOW: u64 = 0x2000;
+
+    let sb = TestSandbox::with_config(|mut cfg| {
+        cfg.inject_init = false;
+        cfg
+    });
+    sb.host_create_file("data", &[0u8; 0x1000]);
+    let entry = sb.lookup_root("data").unwrap();
+
+    let (sender, _) = macos_worker_stub(false);
+    let result = sb.fs.setupmapping(
+        sb.ctx(),
+        entry.inode,
+        0,
+        0,
+        0x1000,
+        0,
+        0,
+        GUEST_BASE,
+        WINDOW,
+        &Some(sender),
+    );
+    TestSandbox::assert_errno(result, LINUX_EINVAL);
+    assert!(sb.fs.map_windows.lock().unwrap().is_empty());
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn setupmapping_honors_readonly_on_macos() {
+    const GUEST_BASE: u64 = 0x1000_0000;
+    const WINDOW: u64 = 0x2000;
+    const SETUPMAPPING_FLAG_WRITE: u64 = 0x1;
+
+    let sb = TestSandbox::with_config(|mut cfg| {
+        cfg.inject_init = false;
+        cfg.readonly = true;
+        cfg
+    });
+    sb.host_create_file("data", &[0u8; 0x1000]);
+    let entry = sb.lookup_root("data").unwrap();
+
+    let (sender, _) = macos_worker_stub(true);
+    let result = sb.fs.setupmapping(
+        sb.ctx(),
+        entry.inode,
+        0,
+        0,
+        0x1000,
+        SETUPMAPPING_FLAG_WRITE,
+        0,
+        GUEST_BASE,
+        WINDOW,
+        &Some(sender),
+    );
+    TestSandbox::assert_errno(result, LINUX_EROFS);
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn setupmapping_requires_a_writable_handle_on_macos() {
+    const GUEST_BASE: u64 = 0x1000_0000;
+    const WINDOW: u64 = 0x2000;
+    const SETUPMAPPING_FLAG_WRITE: u64 = 0x1;
+
+    let sb = TestSandbox::with_config(|mut cfg| {
+        cfg.inject_init = false;
+        cfg
+    });
+    sb.host_create_file("data", &[0u8; 0x1000]);
+    let entry = sb.lookup_root("data").unwrap();
+    let handle = sb.fuse_open(entry.inode, libc::O_RDONLY as u32).unwrap();
+
+    let (sender, _) = macos_worker_stub(true);
+    let result = sb.fs.setupmapping(
+        sb.ctx(),
+        entry.inode,
+        handle,
+        0,
+        0x1000,
+        SETUPMAPPING_FLAG_WRITE,
+        0,
+        GUEST_BASE,
+        WINDOW,
+        &Some(sender),
+    );
+    TestSandbox::assert_errno(result, LINUX_EACCES);
+}
