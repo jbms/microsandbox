@@ -238,6 +238,8 @@ impl PassthroughFsBuilder {
             #[cfg(target_os = "linux")]
             proc_self_fd,
             quota,
+            #[cfg(target_os = "macos")]
+            map_windows: std::sync::Mutex::new(BTreeMap::new()),
         })
     }
 }
