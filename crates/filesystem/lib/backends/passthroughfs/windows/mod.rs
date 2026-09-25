@@ -25,9 +25,11 @@ use crate::{
 
 mod builder;
 mod create_ops;
+mod dax;
 mod dir_ops;
 mod file_ops;
 mod inode;
+mod memory_mapping;
 mod metadata;
 mod mobility;
 mod ops;
@@ -35,7 +37,9 @@ mod owned_metadata;
 mod remove_ops;
 mod stat_store;
 
+use super::window::WindowMapping;
 use inode::{DirHandle, DirSnapshotEntry, HandleData, InodeData, InodeTable};
+use memory_mapping::WindowsFileMappingView;
 pub(super) use owned_metadata::{
     capture_owned_metadata, clear_owned_payload_metadata, owned_component, restore_owned_metadata,
 };
@@ -93,7 +97,9 @@ const LINUX_EROFS: i32 = 30;
 const LINUX_ENOTEMPTY: i32 = 39;
 const LINUX_ELOOP: i32 = 40;
 const LINUX_ENODATA: i32 = 61;
+const LINUX_ESTALE: i32 = 116;
 const LINUX_EOPNOTSUPP: i32 = 95;
+const LINUX_ENOSYS: i32 = 38;
 
 const LINUX_O_ACCMODE: i32 = 0o3;
 const LINUX_O_WRONLY: i32 = 0o1;
@@ -159,6 +165,8 @@ pub struct PassthroughFs {
     stat_store: Option<StatStore>,
     quota: Option<super::quota::DirQuota>,
     invalid_inodes: RwLock<std::collections::BTreeSet<u64>>,
+    /// Installed DAX mappings, keyed by guest address.
+    map_windows: Mutex<BTreeMap<u64, WindowMapping<Arc<WindowsFileMappingView>>>>,
 }
 
 #[repr(C, packed)]

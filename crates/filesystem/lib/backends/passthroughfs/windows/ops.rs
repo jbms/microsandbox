@@ -598,4 +598,46 @@ impl DynFileSystem for PassthroughFs {
         let st = self.stat_from_metadata(&metadata, data.as_ref())?;
         check_access(_ctx, &st, mask)
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn setupmapping(
+        &self,
+        _ctx: Context,
+        inode: u64,
+        _handle: u64,
+        foffset: u64,
+        len: u64,
+        flags: u64,
+        moffset: u64,
+        host_shm_base: u64,
+        shm_size: u64,
+        map_sender: &Option<
+            crossbeam_channel::Sender<msb_krun_utils::worker_message::WorkerMessage>,
+        >,
+    ) -> io::Result<()> {
+        dax::do_setupmapping(
+            self,
+            inode,
+            foffset,
+            len,
+            flags,
+            moffset,
+            host_shm_base,
+            shm_size,
+            map_sender,
+        )
+    }
+
+    fn removemapping(
+        &self,
+        _ctx: Context,
+        requests: Vec<crate::RemovemappingOne>,
+        host_shm_base: u64,
+        shm_size: u64,
+        map_sender: &Option<
+            crossbeam_channel::Sender<msb_krun_utils::worker_message::WorkerMessage>,
+        >,
+    ) -> io::Result<()> {
+        dax::do_removemapping(self, &requests, host_shm_base, shm_size, map_sender)
+    }
 }
