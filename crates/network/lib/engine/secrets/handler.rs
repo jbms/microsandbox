@@ -156,6 +156,9 @@ struct Http2State {
     preface_seen: bool,
     buffer: Vec<u8>,
     header_block: Option<Http2HeaderBlock>,
+    /// Highest client-initiated stream id seen so far. New client streams must
+    /// use strictly increasing ids; a reused id is a protocol violation.
+    highest_client_stream_id: u32,
     open_request_streams: HashSet<u32>,
     data_tails: HashMap<u32, Vec<u8>>,
     request_summaries: HashMap<u32, RequestSummary>,
@@ -502,6 +505,7 @@ impl Default for Http2State {
             preface_seen: false,
             buffer: Vec::new(),
             header_block: None,
+            highest_client_stream_id: 0,
             open_request_streams: HashSet::new(),
             data_tails: HashMap::new(),
             request_summaries: HashMap::new(),
@@ -1961,9 +1965,16 @@ impl Http2State {
         let mut headers = self.decode_headers(&block.block)?;
         let is_initial_request = !self.open_request_streams.contains(&block.stream_id);
         if is_initial_request {
+            // Client-initiated HTTP/2 stream ids must strictly increase. A
+            // reused id would let a previously completed stream be presented
+            // as a fresh request, so fail closed before substitution runs.
+            if block.stream_id <= self.highest_client_stream_id {
+                return Err(SecretViolationAction::Block);
+            }
             if self.open_request_streams.len() >= MAX_HTTP2_TRACKED_STREAMS {
                 return Err(SecretViolationAction::Block);
             }
+            self.highest_client_stream_id = block.stream_id;
             self.open_request_streams.insert(block.stream_id);
         } else if !block.end_stream {
             return Err(SecretViolationAction::Block);
@@ -6662,6 +6673,130 @@ mod tests {
         }
 
         assert!(handler.substitute(&request).is_ok());
+    }
+
+    // The HTTP/2 stream-id reuse checks below are ported from #1227
+    // (originally authored by Liraz Siri). They fail closed when a client
+    // presents a completed stream id as a new request.
+
+    #[test]
+    fn tls_intercepted_http2_rejects_reused_stream_id_after_headers_end_stream() {
+        let config = make_config(vec![make_secret("$KEY", "real-secret", "api.openai.com")]);
+        let mut handler = SecretsHandler::new(&config, "api.openai.com", true);
+        let request = h2_request(
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.openai.com"),
+                (b":path", b"/first"),
+            ],
+            true,
+        );
+        handler.substitute(&request).unwrap();
+
+        let mut reused = Vec::new();
+        append_h2_headers(
+            &mut reused,
+            1,
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.openai.com"),
+                (b":path", b"/reused"),
+                (b"authorization", b"Bearer $KEY"),
+            ],
+            true,
+        );
+
+        assert_eq!(
+            handler.substitute(&reused).unwrap_err(),
+            SecretViolationAction::Block
+        );
+    }
+
+    #[test]
+    fn tls_intercepted_http2_rejects_reused_stream_id_after_data_end_stream() {
+        let config = make_config(vec![make_secret("$KEY", "real-secret", "api.openai.com")]);
+        let mut handler = SecretsHandler::new(&config, "api.openai.com", true);
+        let request = h2_request(
+            &[
+                (b":method", b"POST"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.openai.com"),
+                (b":path", b"/first"),
+            ],
+            false,
+        );
+        handler.substitute(&request).unwrap();
+
+        let mut completed = Vec::new();
+        append_http2_frame(
+            &mut completed,
+            HTTP2_FRAME_DATA,
+            HTTP2_FLAG_END_STREAM,
+            1,
+            b"",
+        )
+        .unwrap();
+        handler.substitute(&completed).unwrap();
+
+        let mut reused = Vec::new();
+        append_h2_headers(
+            &mut reused,
+            1,
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.openai.com"),
+                (b":path", b"/reused"),
+                (b"authorization", b"Bearer $KEY"),
+            ],
+            true,
+        );
+
+        assert_eq!(
+            handler.substitute(&reused).unwrap_err(),
+            SecretViolationAction::Block
+        );
+    }
+
+    #[test]
+    fn tls_intercepted_http2_allows_higher_stream_id_after_close() {
+        let config = make_config(vec![make_secret("$KEY", "real-secret", "api.openai.com")]);
+        let mut handler = SecretsHandler::new(&config, "api.openai.com", true);
+        let request = h2_request(
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.openai.com"),
+                (b":path", b"/first"),
+            ],
+            true,
+        );
+        handler.substitute(&request).unwrap();
+
+        let mut next = Vec::new();
+        append_h2_headers(
+            &mut next,
+            3,
+            &[
+                (b":method", b"GET"),
+                (b":scheme", b"https"),
+                (b":authority", b"api.openai.com"),
+                (b":path", b"/next"),
+                (b"authorization", b"Bearer $KEY"),
+            ],
+            true,
+        );
+
+        let output = handler.substitute(&next).unwrap();
+        let mut framed = HTTP2_PREFACE.to_vec();
+        framed.extend_from_slice(&output);
+        let headers = decode_first_h2_headers(&framed);
+        assert_eq!(
+            h2_header_value(&headers, b"authorization"),
+            "Bearer real-secret"
+        );
     }
 
     #[test]
