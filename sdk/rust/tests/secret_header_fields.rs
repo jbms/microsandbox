@@ -349,12 +349,17 @@ async fn exercise_header_policy(http2: bool) -> Result<()> {
     }
     .await;
 
-    // Always clean up a sandbox after a failed assertion or request.
-    let handle = Sandbox::get(name).await?;
-    handle.stop().await?;
-    Sandbox::remove(name).await?;
+    // Always attempt cleanup, preserving the test failure if both fail.
+    let cleanup: Result<()> = async {
+        let handle = Sandbox::get(name).await?;
+        handle.stop().await?;
+        Sandbox::remove(name).await?;
 
-    result
+        Ok(())
+    }
+    .await;
+
+    result.and(cleanup)
 }
 
 //--------------------------------------------------------------------------------------------------
